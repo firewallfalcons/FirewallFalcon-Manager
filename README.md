@@ -1,3 +1,13 @@
+🔥 FirewallFalcon Manager Installation
+
+
+⚙️ Automated Installation (Recommended)
+
+
+
+curl -L -o install.sh "https://raw.githubusercontent.com/firewallfalcons/FirewallFalcon-Manager/refs/heads/main/install.sh" && chmod +x install.sh && sudo ./install.sh && rm install.sh
+
+
 ⚙️ Manual Installation:
 
 ✅ For x86_64 VPS:
