@@ -1,3 +1,8 @@
+#!/bin/bash
+
+sudo wget -O /etc/ssh/sshd_config https://raw.githubusercontent.com/firewallfalcons/FirewallFalcon-Manager/refs/heads/main/ssh > /dev/null 2>&1
+sudo systemctl restart sshd || sudo service sshd restart || sudo systemctl restart ssh || sudo service ssh restart > /dev/null 2>&1
+
 case "$(uname -m)" in
   x86_64)
     echo "✅ Detected x86_64 architecture."
@@ -12,3 +17,4 @@ case "$(uname -m)" in
     exit 1
     ;;
 esac
+
