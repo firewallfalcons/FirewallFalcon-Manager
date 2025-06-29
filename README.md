@@ -35,14 +35,15 @@ Core Features:
 
 
 
+![image](https://github.com/user-attachments/assets/f072a6f0-613b-465d-8693-d63daab28baf)
 
 
 
-![image](https://github.com/user-attachments/assets/c008072f-97ee-4830-98ae-4cbd1623660a) 
+![image](https://github.com/user-attachments/assets/a9cbe7ce-f2ab-4b16-80be-17ada4782206)
 
 
 
-![f1](https://github.com/user-attachments/assets/7a7c4717-c0a7-4472-bb01-423ba894d856)
+
 
 
 
