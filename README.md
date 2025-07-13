@@ -14,7 +14,8 @@ Create V2Ray inbound on any random port (e.g., 8888).
 
 Set Path/Service Name (e.g., /8888/firewallfalcon for WS/HTTP/h2/HTTPUpgrade, or Service Name /8888/firewallfalcon for gRPC).
 
-<img width="1344" height="628" alt="image" src="https://github.com/user-attachments/assets/375d2c95-ac35-49a7-a89f-29f66239c2e7" />
+<img width="1366" height="643" alt="image" src="https://github.com/user-attachments/assets/5ba7cc2d-939e-475d-a8e8-a49513cb7af5" />
+
 
 
 SSH WebSockets:
