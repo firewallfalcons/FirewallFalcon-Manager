@@ -7,7 +7,18 @@
 curl -L -o install.sh "https://raw.githubusercontent.com/firewallfalcons/FirewallFalcon-Manager/refs/heads/main/install.sh" && chmod +x install.sh && sudo ./install.sh && rm install.sh
 ```
 
+⚡️ Ports 80 & 443 for V2Ray & SSH WebSockets ⚡️
+V2Ray (X-UI Panel):
 
+Create V2Ray inbound on any random port (e.g., 8888).
+
+Set Path/Service Name (e.g., /8888/firewallfalcon for WS/HTTP/h2/HTTPUpgrade, or Service Name /8888/firewallfalcon for gRPC).
+
+SSH WebSockets:
+
+Run your SSH WebSockets proxy on port 8080.
+
+  
 
 Core Features:
 
