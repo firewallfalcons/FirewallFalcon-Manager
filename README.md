@@ -1,6 +1,14 @@
 🔥 FirewallFalcon Manager Installation
 
 
+🚀Support FirewallFalcon Manager🚀
+
+Our script is always FREE—your donation keeps it that way and powers new features!
+
+📥 Donate Tron / TRX (TRC-20): TM2AfVAWQJiuriGC6KoTmsAJuUTTBd2f1R
+
+📥 Binance Pay : 885652061
+
 ⚙️ Automated Installation (Recommended)
 
 ```sh
