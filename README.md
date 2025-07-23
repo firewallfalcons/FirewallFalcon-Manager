@@ -56,7 +56,8 @@ curl -L -o install.sh "https://raw.githubusercontent.com/firewallfalcons/Firewal
 
 ---
 
-![FirewallFalcon Manager User Interface](https://github.com/user-attachments/assets/30873b61-9bfd-4405-bde8-44fb0cfa4113)
+![FirewallFalcon Manager User Interface](https://github.com/user-attachments/assets/787ef17c-3791-4800-8272-bb51c82d96d5)
+
 ![Dashboard Example](https://github.com/user-attachments/assets/575d5380-3b82-4953-9485-ea26e9056724)
 
 ---
