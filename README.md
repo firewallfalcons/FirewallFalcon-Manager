@@ -40,14 +40,14 @@ Easily manage and run a wide range of VPN and proxy protocols:
 Nginx acts as a **smart entry point** for all connections:
 
 * Handles traffic on **ports 80 and 443**
-* Automatically routes requests to the correct backend (**V2Ray/Xray** or **SSH WS**)
+* Automatically routes requests to the correct backend (**V2Ray/Xray**, **SSH WS**, or **Falcon Proxy**)
 * Manages **SSL/TLS termination** for secure connections
 
 ---
 
-### 🧠 DT Proxy
+### 🧠 Falcon Proxy (WebSockets and SOCKS)
 
-**DT Proxy** is a built-in WebSocket and SOCKS proxy that:
+**Falcon Proxy** is a built-in **WebSocket** and **SOCKS** proxy that:
 
 * Returns **fake HTTP responses** (`101 Switching Protocols`, `200 OK`)
 * Accepts **all payloads**
@@ -79,8 +79,8 @@ Nginx acts as a **smart entry point** for all connections:
 ```
 Client → Nginx (80/443)
           ├──> V2Ray/XRay backend  
-          ├──> SSH WebSocket  
-          └──> DT Proxy (8080, no SSL)
+          └──>  Falcon Proxy (WebSocket → SSH)  
+          
 ```
 
 ---
