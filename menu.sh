@@ -63,13 +63,16 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-if ! command -v bc &> /dev/null; then
-    echo -e "${C_YELLOW}⚠️ Warning: 'bc' command not found. Attempting to install it...${C_RESET}"
-    apt-get update > /dev/null 2>&1 && apt-get install -y bc || {
-        echo -e "${C_RED}❌ Error: Failed to install 'bc'. Please install it manually ('apt-get install bc') and re-run the script.${C_RESET}"
-        exit 1
-    }
-fi
+# Mandatory Dependency Check (Added jq and curl)
+for cmd in bc jq curl wget; do
+    if ! command -v $cmd &> /dev/null; then
+        echo -e "${C_YELLOW}⚠️ Warning: '$cmd' not found. Attempting to install it...${C_RESET}"
+        apt-get update > /dev/null 2>&1 && apt-get install -y $cmd || {
+            echo -e "${C_RED}❌ Error: Failed to install '$cmd'. Please install it manually ('apt-get install $cmd') and re-run the script.${C_RESET}"
+            exit 1
+        }
+    fi
+done
 
 _is_valid_ipv4() {
     local ip=$1
@@ -1475,14 +1478,51 @@ uninstall_dnstt() {
 install_falcon_proxy() {
     clear; show_banner
     echo -e "${C_BOLD}${C_PURPLE}--- 🦅 Installing Falcon Proxy (Websockets/Socks) ---${C_RESET}"
+    
     if [ -f "$FALCONPROXY_SERVICE_FILE" ]; then
         echo -e "\n${C_YELLOW}ℹ️ Falcon Proxy is already installed.${C_RESET}"
         if [ -f "$FALCONPROXY_CONFIG_FILE" ]; then
             source "$FALCONPROXY_CONFIG_FILE"
             echo -e "   It is configured to run on port(s): ${C_YELLOW}$PORTS${C_RESET}"
+            echo -e "   Installed Version: ${C_YELLOW}${INSTALLED_VERSION:-Unknown}${C_RESET}"
         fi
+        read -p "👉 Do you want to reinstall/update? (y/n): " confirm_reinstall
+        if [[ "$confirm_reinstall" != "y" ]]; then return; fi
+    fi
+
+    echo -e "\n${C_BLUE}🌐 Fetching available versions from GitHub...${C_RESET}"
+    local releases_json=$(curl -s "https://api.github.com/repos/firewallfalcons/FirewallFalcon-Manager/releases")
+    if [[ -z "$releases_json" || "$releases_json" == "[]" ]]; then
+        echo -e "${C_RED}❌ Error: Could not fetch releases. Check internet or API limits.${C_RESET}"
         return
     fi
+
+    # Extract tag names
+    mapfile -t versions < <(echo "$releases_json" | jq -r '.[].tag_name')
+    
+    if [ ${#versions[@]} -eq 0 ]; then
+        echo -e "${C_RED}❌ No releases found in the repository.${C_RESET}"
+        return
+    fi
+
+    echo -e "\n${C_CYAN}Select a version to install:${C_RESET}"
+    for i in "${!versions[@]}"; do
+        printf "  ${C_GREEN}%2d)${C_RESET} %s\n" "$((i+1))" "${versions[$i]}"
+    done
+    echo -e "  ${C_RED} 0)${C_RESET} ↩️ Cancel"
+    
+    local choice
+    while true; do
+        read -p "👉 Enter version number [1]: " choice
+        choice=${choice:-1}
+        if [[ "$choice" == "0" ]]; then return; fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -le "${#versions[@]}" ]; then
+            SELECTED_VERSION="${versions[$((choice-1))]}"
+            break
+        else
+            echo -e "${C_RED}❌ Invalid selection.${C_RESET}"
+        fi
+    done
 
     local ports
     read -p "👉 Enter port(s) for Falcon Proxy (e.g., 8080 or 8080 8888) [8080]: " ports
@@ -1499,8 +1539,7 @@ install_falcon_proxy() {
     done
 
     echo -e "\n${C_GREEN}⚙️ Detecting system architecture...${C_RESET}"
-    local arch
-    arch=$(uname -m)
+    local arch=$(uname -m)
     local binary_name=""
     if [[ "$arch" == "x86_64" ]]; then
         binary_name="falconproxy"
@@ -1513,14 +1552,13 @@ install_falcon_proxy() {
         return
     fi
     
-    local download_url="https://github.com/firewallfalcons/FirewallFalcon-Manager/releases/latest/download/$binary_name"
+    # Construct download URL based on selected version
+    local download_url="https://github.com/firewallfalcons/FirewallFalcon-Manager/releases/download/$SELECTED_VERSION/$binary_name"
 
-    echo -e "\n${C_GREEN}📥 Downloading Falcon Proxy binary ($binary_name)...${C_RESET}"
+    echo -e "\n${C_GREEN}📥 Downloading Falcon Proxy $SELECTED_VERSION ($binary_name)...${C_RESET}"
     wget -q --show-progress -O "$FALCONPROXY_BINARY" "$download_url"
     if [ $? -ne 0 ]; then
-        echo -e "\n${C_RED}❌ Failed to download the Falcon Proxy binary.${C_RESET}"
-        echo -e "   Please check the release page: https://github.com/firewallfalcons/FirewallFalcon-Manager/releases/"
-        rm -f "$FALCONPROXY_BINARY"
+        echo -e "\n${C_RED}❌ Failed to download the binary. Please ensure version $SELECTED_VERSION has asset '$binary_name'.${C_RESET}"
         return
     fi
     chmod +x "$FALCONPROXY_BINARY"
@@ -1528,7 +1566,7 @@ install_falcon_proxy() {
     echo -e "\n${C_GREEN}📝 Creating systemd service file...${C_RESET}"
     cat > "$FALCONPROXY_SERVICE_FILE" <<EOF
 [Unit]
-Description=Falcon Proxy (Websockets/Socks)
+Description=Falcon Proxy ($SELECTED_VERSION)
 After=network.target
 
 [Service]
@@ -1543,16 +1581,19 @@ WantedBy=default.target
 EOF
 
     echo -e "\n${C_GREEN}💾 Saving configuration...${C_RESET}"
-    echo "PORTS=\"$ports\"" > "$FALCONPROXY_CONFIG_FILE"
+    cat > "$FALCONPROXY_CONFIG_FILE" <<EOF
+PORTS="$ports"
+INSTALLED_VERSION="$SELECTED_VERSION"
+EOF
 
     echo -e "\n${C_GREEN}▶️ Enabling and starting Falcon Proxy service...${C_RESET}"
     systemctl daemon-reload
     systemctl enable falconproxy.service
-    systemctl start falconproxy.service
+    systemctl restart falconproxy.service
     sleep 2
     
     if systemctl is-active --quiet falconproxy; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: Falcon Proxy is installed and active.${C_RESET}"
+        echo -e "\n${C_GREEN}✅ SUCCESS: Falcon Proxy $SELECTED_VERSION is installed and active.${C_RESET}"
         echo -e "   Listening on port(s): ${C_YELLOW}$ports${C_RESET}"
     else
         echo -e "\n${C_RED}❌ ERROR: Falcon Proxy service failed to start.${C_RESET}"
@@ -1718,7 +1759,6 @@ EOF
     else
         echo -e "\n${C_RED}❌ ZiVPN Service failed to start. Check logs: journalctl -u zivpn.service${C_RESET}"
     fi
-    press_enter
 }
 
 uninstall_zivpn() {
@@ -1749,7 +1789,6 @@ uninstall_zivpn() {
     sync; echo 3 > /proc/sys/vm/drop_caches
 
     echo -e "\n${C_GREEN}✅ ZiVPN Uninstalled Successfully.${C_RESET}"
-    press_enter
 }
 
 purge_nginx() {
@@ -2135,7 +2174,7 @@ protocol_menu() {
         if systemctl is-active --quiet falconproxy; then
             if [ -f "$FALCONPROXY_CONFIG_FILE" ]; then source "$FALCONPROXY_CONFIG_FILE"; fi
             falconproxy_ports=" ($PORTS)"
-            falconproxy_status="${C_STATUS_A}(Active)${C_RESET}"
+            falconproxy_status="${C_STATUS_A}(Active - ${INSTALLED_VERSION:-latest})${C_RESET}"
         fi
 
         local nginx_status; if systemctl is-active --quiet nginx; then nginx_status="${C_STATUS_A}(Active)${C_RESET}"; else nginx_status="${C_STATUS_I}(Inactive)${C_RESET}"; fi
@@ -2151,7 +2190,7 @@ protocol_menu() {
         echo -e "     ${C_CHOICE}6)${C_RESET} 🗑️ Uninstall SSL Tunnel"
         echo -e "     ${C_CHOICE}7)${C_RESET} 📡 Install/View DNSTT (Port 53) $dnstt_status"
         echo -e "     ${C_CHOICE}8)${C_RESET} 🗑️ Uninstall DNSTT"
-        echo -e "     ${C_CHOICE}9)${C_RESET} 🦅 Install Falcon Proxy(Websockets and Socks) ${falconproxy_ports} $falconproxy_status"
+        echo -e "     ${C_CHOICE}9)${C_RESET} 🦅 Install Falcon Proxy (Select Version) ${falconproxy_ports} $falconproxy_status"
         echo -e "     ${C_CHOICE}10)${C_RESET} 🗑️ Uninstall Falcon Proxy"
         echo -e "     ${C_CHOICE}11)${C_RESET} 🌐 Install/Manage Nginx Proxy (80/443) $nginx_status"
         echo -e "     ${C_CHOICE}16)${C_RESET} 🛡️ Install ZiVPN (UDP 5667 + Port Share) $zivpn_status"
@@ -2171,7 +2210,7 @@ protocol_menu() {
             9) install_falcon_proxy; press_enter ;; 10) uninstall_falcon_proxy; press_enter ;;
             11) nginx_proxy_menu ;;
             12) install_xui_panel; press_enter ;; 13) uninstall_xui_panel; press_enter ;;
-            16) install_zivpn ;; 17) uninstall_zivpn ;;
+            16) install_zivpn; press_enter ;; 17) uninstall_zivpn; press_enter ;;
             0) return ;;
             *) invalid_option ;;
         esac
