@@ -1295,17 +1295,31 @@ install_dnstt() {
 
     check_and_open_firewall_port 53 udp || return
 
+    # --- Enable IP Forwarding ---
+    echo -e "\n${C_GREEN}⚙️ Enabling IP Forwarding...${C_RESET}"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
     local forward_port=""
     local forward_desc=""
     echo -e "\n${C_BLUE}Please choose where DNSTT should forward traffic:${C_RESET}"
-    echo -e "  ${C_GREEN}1)${C_RESET} ➡️ Forward to local SSH service (port 22)"
-    echo -e "  ${C_GREEN}2)${C_RESET} ➡️ Forward to local V2Ray backend (port 8787)"
+    echo -e "  ${C_GREEN}[ 1]${C_RESET} ➡️ Forward to local SSH service (port 22)"
+    echo -e "  ${C_GREEN}[ 2]${C_RESET} ➡️ Forward to local V2Ray backend (port 8787)"
     read -p "👉 Enter your choice [2]: " fwd_choice
     fwd_choice=${fwd_choice:-2}
     if [[ "$fwd_choice" == "1" ]]; then
         forward_port="22"
         forward_desc="SSH (port 22)"
         echo -e "${C_GREEN}ℹ️ DNSTT will forward to SSH on 127.0.0.1:22.${C_RESET}"
+        
+        # Auto-install BadVPN for SSH
+        if ! systemctl is-active --quiet badvpn; then
+            echo -e "\n${C_YELLOW}⚠️ SSH over DNSTT requires 'badvpn' for UDP/Ping support.${C_RESET}"
+            echo -e "${C_BLUE}⚙️ Installing/Starting BadVPN (udpgw)...${C_RESET}"
+            install_badvpn
+        fi
+        
     elif [[ "$fwd_choice" == "2" ]]; then
         forward_port="8787"
         forward_desc="V2Ray (port 8787)"
@@ -1378,8 +1392,11 @@ install_dnstt() {
             return 1
         fi
     fi
-
-    read -p "👉 Enter MTU value (e.g., 512, 1200) or press [Enter] for default: " mtu_value
+    
+    # Default MTU safest for DNS Tunnel is 1200
+    read -p "👉 Enter MTU value (e.g., 1200) or press [Enter] for default [1200]: " mtu_value
+    mtu_value=${mtu_value:-1200}
+    
     local mtu_string=""
     if [[ "$mtu_value" =~ ^[0-9]+$ ]]; then
         mtu_string=" -mtu $mtu_value"
