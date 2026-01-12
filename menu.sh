@@ -268,6 +268,9 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+    # Force kill any old limiter process to prevent systemctl restart hanging
+    pkill -f "firewallfalcon-limiter" 2>/dev/null
+
     if ! systemctl is-active --quiet firewallfalcon-limiter; then
         systemctl daemon-reload
         systemctl enable firewallfalcon-limiter &>/dev/null
@@ -2813,11 +2816,11 @@ main_menu() {
         
         echo
         echo -e "   ${C_TITLE}═══════════════[ ${C_BOLD}⚙️ SYSTEM UTILITIES ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔌 8" "Install Protocols" "🌐 11" "Manage DNS Domain"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "💾 9" "Backup User Data" "🎨 12" "SSH Banner Management"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "📥 10" "Restore User Data" "🧹 13" "Cleanup Expired Users"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🚀 14" "DT Proxy Management" "📈 18" "Traffic Monitor (Lite)"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🚫 19" "Block Torrent (Anti-P2P)" "🔄 20" "Auto-Reboot (Midnight)"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔌 8" "Install Protocols" "🧹 13" "Cleanup Expired Users"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "💾 9" "Backup User Data" "🚀 14" "DT Proxy Management"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "📥 10" "Restore User Data" "📈 16" "Traffic Monitor (Lite)"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🌐 11" "Manage DNS Domain" "🚫 17" "Block Torrent (Anti-P2P)"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🎨 12" "SSH Banner Management" "🔄 18" "Auto-Reboot (Midnight)"
 
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
@@ -2841,9 +2844,9 @@ main_menu() {
             13) cleanup_expired; press_enter ;;
             14) dt_proxy_menu ;;
             15) client_config_menu; press_enter ;;
-            18) traffic_monitor_menu ;;
-            19) torrent_block_menu ;;
-            20) auto_reboot_menu ;;
+            16) traffic_monitor_menu ;;
+            17) torrent_block_menu ;;
+            18) auto_reboot_menu ;;
             99) uninstall_script ;;
             0) echo -e "\n${C_BLUE}👋 Goodbye!${C_RESET}"; exit 0 ;;
             *) invalid_option ;;
