@@ -274,11 +274,11 @@ EOF
     if ! systemctl is-active --quiet firewallfalcon-limiter; then
         systemctl daemon-reload
         systemctl enable firewallfalcon-limiter &>/dev/null
-        systemctl start firewallfalcon-limiter &>/dev/null
+        systemctl start firewallfalcon-limiter --no-block &>/dev/null
         
     else
         # Restart if already running to apply new logic
-        systemctl restart firewallfalcon-limiter &>/dev/null
+        systemctl restart firewallfalcon-limiter --no-block &>/dev/null
         
     fi
 }
@@ -2808,46 +2808,51 @@ main_menu() {
         
         echo
         echo -e "   ${C_TITLE}═══════════════[ ${C_BOLD}👤 USER MANAGEMENT ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "✨ 1" "Create New User" "🔓 5" "Unlock User Account"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🗑 2" "Delete User" "📋 6" "List All Managed Users"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "✏️ 3" "Edit User Details" "🔄 7" "Renew User Account"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔒 4" "Lock User Account" "📱 8" "Generate Client Config"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "1" "Create New User" "5" "Unlock User Account"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "2" "Delete User" "6" "Edit User Details"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "3" "Renew User Account" "7" "List Managed Users"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "4" "Lock User Account" "8" "Generate Client Config"
         
         echo
-        echo -e "   ${C_TITLE}═══════════════[ ${C_BOLD}⚙️ SYSTEM UTILITIES ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔌 9" "Install Protocols" "🧹 14" "Cleanup Expired Users"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "💾 10" "Backup User Data" "🚀 15" "DT Proxy Management"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "📥 11" "Restore User Data" "📈 16" "Traffic Monitor (Lite)"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🌐 12" "Manage DNS Domain" "🚫 17" "Block Torrent (Anti-P2P)"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🎨 13" "SSH Banner Management" "🔄 18" "Auto-Reboot (Midnight)"
+        echo -e "   ${C_TITLE}════════════[ ${C_BOLD}🌐 VPN & PROTOCOLS ${C_RESET}${C_TITLE}]═════════════${C_RESET}"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "9" "Protocol Manager" "11" "Traffic Monitor (Lite)"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "10" "DT Proxy Manager" "12" "Block Torrent (Anti-P2P)"
+
+        echo
+        echo -e "   ${C_TITLE}════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═════════════${C_RESET}"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "13" "DNS Domain Config" "16" "Backup User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "14" "SSH Banner Config" "17" "Restore User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "15" "Auto-Reboot Task" "18" "Cleanup Expired Users"
 
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
-        printf "     ${C_DANGER}%2s${C_RESET}) %-28s ${C_DANGER}%2s${C_RESET}) %-25s\n" "💥 99" "Uninstall Script" "🚪 0" "Exit"
-
+        echo -e "     ${C_DANGER}[99]${C_RESET} Uninstall Script             ${C_WARN}[ 0]${C_RESET} Exit"
         echo
         read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
         case $choice in
             1) create_user; press_enter ;;
             2) delete_user; press_enter ;;
-            3) edit_user; press_enter ;;
+            3) renew_user; press_enter ;;
             4) lock_user; press_enter ;;
             5) unlock_user; press_enter ;;
-            6) list_users; press_enter ;;
-            7) renew_user; press_enter ;;
+            6) edit_user; press_enter ;;
+            7) list_users; press_enter ;;
             8) client_config_menu; press_enter ;;
+            
             9) protocol_menu ;;
-            10) backup_user_data; press_enter ;;
-            11) restore_user_data; press_enter ;;
-            12) dns_menu; press_enter ;;
-            13) ssh_banner_menu ;;
-            14) cleanup_expired; press_enter ;;
-            15) dt_proxy_menu ;;
-            16) traffic_monitor_menu ;;
-            17) torrent_block_menu ;;
-            18) auto_reboot_menu ;;
+            10) dt_proxy_menu ;;
+            11) traffic_monitor_menu ;;
+            12) torrent_block_menu ;;
+            
+            13) dns_menu; press_enter ;;
+            14) ssh_banner_menu ;;
+            15) auto_reboot_menu ;;
+            16) backup_user_data; press_enter ;;
+            17) restore_user_data; press_enter ;;
+            18) cleanup_expired; press_enter ;;
+            
             99) uninstall_script ;;
-            0) echo -e "\n${C_BLUE}👋 Goodbye!${C_RESET}"; exit 0 ;;
+            0) exit 0 ;;
             *) invalid_option ;;
         esac
     done
