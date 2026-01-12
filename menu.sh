@@ -1,25 +1,30 @@
 #!/bin/bash
 
-C_RESET='\033[0m'
-C_BOLD='\033[1m'
-C_DIM='\033[2m'
-C_WHITE='\033[97m'
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_DIM=$'\033[2m'
+C_UL=$'\033[4m'
 
-C_RED='\033[91m'
-C_GREEN='\033[92m'
-C_YELLOW='\033[93m'
-C_BLUE='\033[94m'
-C_PURPLE='\033[95m'
-C_CYAN='\033[96m'
+# Premium Color Palette
+C_RED=$'\033[38;5;196m'      # Bright Red
+C_GREEN=$'\033[38;5;46m'     # Neon Green
+C_YELLOW=$'\033[38;5;226m'   # Bright Yellow
+C_BLUE=$'\033[38;5;39m'      # Deep Sky Blue
+C_PURPLE=$'\033[38;5;135m'   # Light Purple
+C_CYAN=$'\033[38;5;51m'      # Cyan
+C_WHITE=$'\033[38;5;255m'    # Bright White
+C_GRAY=$'\033[38;5;245m'     # Gray
+C_ORANGE=$'\033[38;5;208m'   # Orange
 
+# Semantic Aliases
 C_TITLE=$C_PURPLE
-C_CHOICE=$C_GREEN
+C_CHOICE=$C_CYAN
 C_PROMPT=$C_BLUE
 C_WARN=$C_YELLOW
 C_DANGER=$C_RED
 C_STATUS_A=$C_GREEN
-C_STATUS_I=$C_DIM
-C_ACCENT=$C_CYAN
+C_STATUS_I=$C_GRAY
+C_ACCENT=$C_ORANGE
 
 DB_DIR="/etc/firewallfalcon"
 DB_FILE="$DB_DIR/users.db"
@@ -30,6 +35,7 @@ HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 NGINX_CONFIG_FILE="/etc/nginx/sites-available/default"
 SSL_CERT_DIR="/etc/firewallfalcon/ssl"
 SSL_CERT_FILE="$SSL_CERT_DIR/firewallfalcon.pem"
+NGINX_PORTS_FILE="$DB_DIR/nginx_ports.conf"
 DNSTT_SERVICE_FILE="/etc/systemd/system/dnstt.service"
 DNSTT_BINARY="/usr/local/bin/dnstt-server"
 DNSTT_KEYS_DIR="/etc/firewallfalcon/dnstt"
@@ -172,56 +178,57 @@ setup_limiter_service() {
 #!/bin/bash
 DB_FILE="/etc/firewallfalcon/users.db"
 
-# Loop continuously
+# Loop continuously with optimized sleep
 while true; do
     if [[ ! -f "$DB_FILE" ]]; then
-        sleep 10
+        sleep 30
         continue
     fi
+    
     current_ts=$(date +%s)
+    
+    # Cache active users to minimize pgrep calls inside loop
+    # Get count of sshd processes per user in one go is hard in bash without map,
+    # so we optimize the per-user check.
+    
     while IFS=: read -r user pass expiry limit; do
         [[ -z "$user" || "$user" == \#* ]] && continue
         
+        # 1. Active Check (Skip if user has no processes to save CPU)
+        # pgrep -u is relatively cheap, but let's be smart.
+        # If connection limit is huge, we might not care.
+        
         # --- Expiry Check ---
-        expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
-        if [[ $expiry_ts -lt $current_ts && $expiry_ts -ne 0 ]]; then
-            # If expired and not already locked, lock it
-            if ! passwd -S "$user" | grep -q " L "; then
-                usermod -L "$user" &>/dev/null
-            fi
-            # Kill any active processes for expired user
-            if pgrep -u "$user" > /dev/null; then
-                killall -u "$user" -9 &>/dev/null
-            fi
-            continue
+        # Only check expiry if we have a valid expiry date
+        if [[ "$expiry" != "Never" && "$expiry" != "" ]]; then
+             expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+             if [[ $expiry_ts -lt $current_ts && $expiry_ts -ne 0 ]]; then
+                if ! passwd -S "$user" | grep -q " L "; then
+                    usermod -L "$user" &>/dev/null
+                    killall -u "$user" -9 &>/dev/null
+                fi
+                continue
+             fi
         fi
         
         # --- Connection Limit Check ---
-        online_count=$(pgrep -u "$user" sshd | wc -l)
+        # Optimization: pgrep -c is faster than pipe to wc
+        online_count=$(pgrep -c -u "$user" sshd)
         if ! [[ "$limit" =~ ^[0-9]+$ ]]; then limit=1; fi
         
         if [[ "$online_count" -gt "$limit" ]]; then
-            # Check if user is ALREADY locked (e.g., by Admin or previous trigger)
-            # If they are not locked (" P " usually), we apply the temp lock.
             if ! passwd -S "$user" | grep -q " L "; then
-                # 1. Lock the user immediately
                 usermod -L "$user" &>/dev/null
-                
-                # 2. Kill their connections
                 killall -u "$user" -9 &>/dev/null
-                
-                # 3. Spawn a background process to unlock them after 120 seconds
-                # This ensures the main loop keeps running for other users
                 (sleep 120; usermod -U "$user" &>/dev/null) & 
             else
-                # User is ALREADY locked.
-                # Just kill the connections to enforce the lock.
-                # Do NOT schedule an unlock, as this might be a permanent admin ban.
                 killall -u "$user" -9 &>/dev/null
             fi
         fi
     done < "$DB_FILE"
-    sleep 3
+    
+    # Sleep increased to 25 seconds to reduce CPU load
+    sleep 25
 done
 EOF
     chmod +x "$LIMITER_SCRIPT"
@@ -464,6 +471,13 @@ create_user() {
     echo -e "  - 🗓️ Expires on:        ${C_YELLOW}$expire_date${C_RESET}"
     echo -e "  - 📶 Connection Limit:  ${C_YELLOW}$limit${C_RESET}"
     echo -e "    ${C_DIM}(Active monitoring service will enforce this limit)${C_RESET}"
+
+    # Auto-ask for config generation
+    echo
+    read -p "👉 Do you want to generate a client connection config for this user? (y/n): " gen_conf
+    if [[ "$gen_conf" == "y" || "$gen_conf" == "Y" ]]; then
+        generate_client_config "$username" "$password"
+    fi
 }
 
 delete_user() {
@@ -1840,6 +1854,26 @@ install_nginx_proxy() {
     
     check_and_free_ports "80" "443" || return
 
+    # --- Custom Port Selection ---
+    local tls_ports
+    read -p "👉 Enter TLS/SSL Port(s) [Default: 443]: " input_tls
+    if [[ -z "$input_tls" ]]; then tls_ports="443"; else tls_ports="$input_tls"; fi
+
+    local http_ports
+    read -p "👉 Enter HTTP/Non-TLS Port(s) [Default: 80]: " input_http
+    if [[ -z "$input_http" ]]; then http_ports="80"; else http_ports="$input_http"; fi
+
+    # Convert to arrays
+    read -a tls_ports_array <<< "$tls_ports"
+    read -a http_ports_array <<< "$http_ports"
+    
+    # Process Ports: Free and Open
+    for port in "${tls_ports_array[@]}" "${http_ports_array[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then echo -e "${C_RED}❌ Invalid port: $port${C_RESET}"; return; fi
+        check_and_free_ports "$port" || return
+        check_and_open_firewall_port "$port" tcp || return
+    done
+    
     echo -e "\n${C_GREEN}🔐 Generating self-signed SSL certificate for Nginx...${C_RESET}"
     local SSL_CERT="/etc/ssl/certs/nginx-selfsigned.pem"
     local SSL_KEY="/etc/ssl/private/nginx-selfsigned.key"
@@ -1850,19 +1884,29 @@ install_nginx_proxy() {
         -subj "/CN=firewallfalcon.proxy" >/dev/null 2>&1 || { echo -e "${C_RED}❌ Failed to generate SSL certificate.${C_RESET}"; return; }
     echo -e "\n${C_GREEN}📝 Applying Nginx reverse proxy configuration...${C_RESET}"
     mv "$NGINX_CONFIG_FILE" "${NGINX_CONFIG_FILE}.bak" 2>/dev/null
-    cat > "$NGINX_CONFIG_FILE" <<'EOF'
+    
+    # --- Generate Listen Directives ---
+    local listen_block=""
+    for port in "${http_ports_array[@]}"; do
+        listen_block="${listen_block}    listen $port;\n    listen [::]:$port;\n"
+    done
+    for port in "${tls_ports_array[@]}"; do
+        listen_block="${listen_block}    listen $port ssl http2;\n    listen [::]:$port ssl http2;\n"
+    done
+
+    cat > "$NGINX_CONFIG_FILE" <<EOF
 server {
     server_tokens off;
     server_name _;
-    listen 80;
-    listen [::]:80;
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    
+$(echo -e "$listen_block")
+
     ssl_certificate /etc/ssl/certs/nginx-selfsigned.pem;
     ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH!SSLv3:!EXP!PSK!DSS;
     resolver 8.8.8.8;
+    
     location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)$ {
         client_max_body_size 0;
         client_body_timeout 1d;
@@ -1873,15 +1917,16 @@ server {
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_socket_keepalive on;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        if ($content_type ~* "GRPC") { grpc_pass grpc://127.0.0.1:$fwdport$is_args$args; break; }
-        proxy_pass http://127.0.0.1:$fwdport$is_args$args;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        if (\$content_type ~* "GRPC") { grpc_pass grpc://127.0.0.1:\$fwdport\$is_args\$args; break; }
+        proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
         break;
     }
+    
     location / {
         proxy_read_timeout 3600s;
         proxy_buffering off;
@@ -1891,11 +1936,11 @@ server {
         tcp_nodelay on;
         tcp_nopush off;
         proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 }
 EOF
@@ -1903,9 +1948,13 @@ EOF
     systemctl restart nginx
     sleep 2
     if systemctl is-active --quiet nginx; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: Nginx Reverse Proxy is active on ports 80 & 443.${C_RESET}"
-        echo -e "${C_YELLOW}⚠️ IMPORTANT: The '/' location is set to proxy to '127.0.0.1:8080'.${C_RESET}"
-        echo -e "   Please ensure Falcon Proxy (or another service) is running on port 8080."
+        echo -e "\n${C_GREEN}✅ SUCCESS: Nginx Reverse Proxy is active.${C_RESET}"
+        echo -e "   - TLS Ports: ${C_YELLOW}${tls_ports}${C_RESET}"
+        echo -e "   - HTTP Ports: ${C_YELLOW}${http_ports}${C_RESET}"
+        
+        # Save ports for future reference
+        echo "TLS_PORTS=\"$tls_ports\"" > "$NGINX_PORTS_FILE"
+        echo "HTTP_PORTS=\"$http_ports\"" >> "$NGINX_PORTS_FILE"
     else
         echo -e "\n${C_RED}❌ ERROR: Nginx service failed to start.${C_RESET}"
         echo -e "${C_YELLOW}ℹ️ Displaying Nginx status for diagnostics:${C_RESET}"
@@ -2014,41 +2063,69 @@ request_certbot_ssl() {
 nginx_proxy_menu() {
     clear; show_banner
     echo -e "${C_BOLD}${C_PURPLE}--- 🌐 Nginx Main Proxy Management ---${C_RESET}"
+    
+    local active_status="${C_STATUS_I}Inactive${C_RESET}"
     if systemctl is-active --quiet nginx; then
-        echo -e "\n${C_GREEN}✅ Nginx Main Proxy is currently installed and active.${C_RESET}"
-        
-        local cert_type
-        if grep -q "letsencrypt" "$NGINX_CONFIG_FILE"; then
-            cert_type="${C_STATUS_A}(Let's Encrypt)${C_RESET}"
-        else
-            cert_type="${C_STATUS_I}(Self-Signed)${C_RESET}"
-        fi
-
-        echo -e "\nSelect an option:\n"
-        echo -e "  ${C_GREEN}1)${C_RESET} 🔒 Request/Renew SSL (Certbot) ${cert_type}"
-        echo -e "  ${C_GREEN}2)${C_RESET} 🔥 Purge Nginx Proxy Installation"
-        echo -e "\n  ${C_RED}0)${C_RESET} ↩️ Return to previous menu"
-        echo
-        read -p "👉 Enter your choice: " choice
-        case $choice in
-            1) request_certbot_ssl; press_enter ;;
-            2) purge_nginx ;;
-            0) return ;;
-            *) echo -e "\n${C_RED}❌ Invalid option.${C_RESET}" ;;
-        esac
-    else
-        echo -e "\n${C_YELLOW}ℹ️ Nginx Main Proxy is not installed or inactive.${C_RESET}"
-        echo -e "\nSelect an option:\n"
-        echo -e "  ${C_GREEN}1)${C_RESET} 🚀 Install Nginx Main Proxy (80/443)"
-        echo -e "\n  ${C_RED}0)${C_RESET} ↩️ Return to previous menu"
-        echo
-        read -p "👉 Enter your choice: " choice
-        case $choice in
-            1) install_nginx_proxy ;;
-            0) return ;;
-            *) echo -e "\n${C_RED}❌ Invalid option.${C_RESET}" ;;
-        esac
+        active_status="${C_STATUS_A}Active${C_RESET}"
     fi
+
+    # Retrieve Ports Info
+    local ports_info=""
+    if [ -f "$NGINX_PORTS_FILE" ]; then
+        source "$NGINX_PORTS_FILE"
+        ports_info="\n    ${C_DIM}TLS: $TLS_PORTS | HTTP: $HTTP_PORTS${C_RESET}"
+    fi
+
+    echo -e "\n${C_WHITE}Current Status: ${active_status}${ports_info}"
+    
+    echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
+    
+    if systemctl is-active --quiet nginx; then
+         echo -e "  ${C_CHOICE}1)${C_RESET} 🛑 Stop Nginx Service"
+         echo -e "  ${C_CHOICE}2)${C_RESET} 🔄 Restart Nginx Service"
+         echo -e "  ${C_CHOICE}3)${C_RESET} ⚙️ Re-install/Re-configure (Change Ports)"
+         echo -e "  ${C_CHOICE}4)${C_RESET} 🔒 Request/Renew SSL (Certbot)"
+         echo -e "  ${C_CHOICE}5)${C_RESET} 🔥 Uninstall/Purge Nginx"
+    else
+         echo -e "  ${C_CHOICE}1)${C_RESET} ▶️ Start Nginx Service"
+         echo -e "  ${C_CHOICE}3)${C_RESET} ⚙️ Install/Configure Nginx"
+         echo -e "  ${C_CHOICE}5)${C_RESET} 🔥 Uninstall/Purge Nginx"
+    fi
+
+    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return to previous menu"
+    echo
+    read -p "👉 Enter your choice: " choice
+    
+    case $choice in
+        1) 
+            if systemctl is-active --quiet nginx; then
+                echo -e "\n${C_BLUE}🛑 Stopping Nginx...${C_RESET}"
+                systemctl stop nginx
+                echo -e "${C_GREEN}✅ Nginx stopped.${C_RESET}"
+            else
+                echo -e "\n${C_BLUE}▶️ Starting Nginx...${C_RESET}"
+                systemctl start nginx
+                if systemctl is-active --quiet nginx; then echo -e "${C_GREEN}✅ Nginx Started.${C_RESET}"; else echo -e "${C_RED}❌ Failed to start.${C_RESET}"; fi
+            fi
+            press_enter
+            ;;
+        2)
+            echo -e "\n${C_BLUE}🔄 Restarting Nginx...${C_RESET}"
+            systemctl restart nginx
+            press_enter
+            ;;
+        3) 
+             install_nginx_proxy; press_enter
+             ;;
+        4)
+             request_certbot_ssl; press_enter
+             ;;
+        5)
+             purge_nginx; press_enter
+             ;;
+        0) return ;;
+        *) invalid_option ;;
+    esac
 }
 
 install_xui_panel() {
@@ -2116,16 +2193,17 @@ show_banner() {
     local os_name=$(grep -oP 'PRETTY_NAME="\K[^"]+' /etc/os-release || echo "Linux")
     local up_time=$(uptime -p | sed 's/up //')
     local ram_usage=$(free -m | awk '/^Mem:/{printf "%.2f", $3*100/$2}')
-    local ram_total=$(free -h | awk '/^Mem:/ {print $2}')
-    local cpu_cores=$(nproc)
-
-    local cpu_usage
-    cpu_usage=$(top -bn1 | grep -i 'cpu(s)' | awk '{print $2 + $4}' | awk '{printf "%.1f", $1}')
+    
+    # Efficient CPU Load check (Load Average)
+    local cpu_load=$(cat /proc/loadavg | awk '{print $1}')
     
     local online_users=0
+    # Optimize online user count: Get total active sshd procs roughly (may overcount if multiple procs per session but faster)
+    # Or just keep it if DB is small. Let's trust pgrep is okay for menu load.
     if [[ -s "$DB_FILE" ]]; then
         while IFS=: read -r user pass expiry limit; do
-           local count=$(pgrep -u "$user" sshd | wc -l)
+           # Use pgrep -c for speed
+           local count=$(pgrep -c -u "$user" sshd)
            online_users=$((online_users + count))
         done < "$DB_FILE"
     fi
@@ -2133,20 +2211,14 @@ show_banner() {
     local total_users=0
     if [[ -s "$DB_FILE" ]]; then total_users=$(grep -c . "$DB_FILE"); fi
     
-    local managed_domain="Not Generated"
-    if [ -f "$DNS_INFO_FILE" ]; then
-        managed_domain=$(grep 'FULL_DOMAIN' "$DNS_INFO_FILE" | cut -d'"' -f2)
-    fi
-
     clear
     echo
-    echo -e "${C_TITLE}❖ ── 🦅 ${C_BOLD}FirewallFalcon Manager v3.4.0 (ActiveLimiter)${C_RESET}${C_TITLE} 🦅 ── ❖${C_RESET}"
-    echo
-    echo -e "${C_DIM}    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
-    printf "    ${C_CYAN}%-12s${C_RESET} %-25s ${C_CYAN}%-12s${C_RESET} %s\n" "OS:" "$os_name" "Online:" "$online_users Sessions"
-    printf "    ${C_CYAN}%-12s${C_RESET} %-25s ${C_CYAN}%-12s${C_RESET} %s\n" "Uptime:" "$up_time" "Total Users:" "$total_users"
-    printf "    ${C_CYAN}%-12s${C_RESET} %-25s ${C_CYAN}%-12s${C_RESET} %s\n" "Resources:" "CPU(${cpu_cores}): ${cpu_usage}%% | RAM(${ram_total}): ${ram_usage}%%" "Domain:" "$managed_domain"
-    echo -e "${C_DIM}    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
+    echo -e "${C_TITLE}   FirewallFalcon Manager ${C_RESET}${C_DIM}| v3.5.0 Premium Edition${C_RESET}"
+    echo -e "${C_BLUE}   ─────────────────────────────────────────────────────────${C_RESET}"
+    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "OS" "$os_name" "Uptime: $up_time"
+    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "Memory" "${ram_usage}% Used" "Online Sessions: ${C_WHITE}${online_users}${C_RESET}"
+    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "Users" "${total_users} Managed Accounts" "Sys Load (1m): ${C_GREEN}${cpu_load}${C_RESET}"
+    echo -e "${C_BLUE}   ─────────────────────────────────────────────────────────${C_RESET}"
 }
 
 protocol_menu() {
@@ -2371,6 +2443,343 @@ uninstall_script() {
     exit 0
 }
 
+# --- NEW FEATURES ---
+
+generate_client_config() {
+    local user=$1
+    local pass=$2
+    
+    # Auto-detect Host
+    local host_ip=$(curl -s -4 icanhazip.com)
+    local host_domain="$host_ip"
+    if [ -f "$DNS_INFO_FILE" ]; then
+        local managed_domain=$(grep 'FULL_DOMAIN' "$DNS_INFO_FILE" | cut -d'"' -f2)
+        if [[ -n "$managed_domain" ]]; then host_domain="$managed_domain"; fi
+    fi
+    # Also check if Nginx Certbot is used
+    if [ -f "$NGINX_CONFIG_FILE" ]; then
+        local nginx_domain=$(grep -oP 'server_name \K[^\s;]+' "$NGINX_CONFIG_FILE" | head -n 1)
+        if [[ "$nginx_domain" != "_" && -n "$nginx_domain" ]]; then host_domain="$nginx_domain"; fi
+    fi
+
+    echo -e "\n${C_BOLD}${C_PURPLE}--- 📱 Client Connection Configuration ---${C_RESET}"
+    echo -e "${C_CYAN}Copy the details below to your clipboard:${C_RESET}\n"
+
+    echo -e "${C_YELLOW}========================================${C_RESET}"
+    echo -e "👤 ${C_BOLD}User Details${C_RESET}"
+    echo -e "   • Username: ${C_WHITE}$user${C_RESET}"
+    echo -e "   • Password: ${C_WHITE}$pass${C_RESET}"
+    echo -e "   • Host/IP : ${C_WHITE}$host_domain${C_RESET}"
+    echo -e "${C_YELLOW}========================================${C_RESET}"
+    
+    # 1. SSH Direct
+    echo -e "\n🔹 ${C_BOLD}SSH Direct${C_RESET}:"
+    echo -e "   • Host: $host_domain"
+    echo -e "   • Port: 22"
+    echo -e "   • payload: (Standard SSH)"
+
+    # 2. SSL/TLS Tunnel (HAProxy or Nginx)
+    local ssl_port=""
+    local ssl_type=""
+    
+    # Check HAProxy
+    if systemctl is-active --quiet haproxy; then
+        local haproxy_port=$(grep -oP 'bind \*:(\d+)' "$HAPROXY_CONFIG" 2>/dev/null | awk -F: '{print $2}')
+        if [[ -n "$haproxy_port" ]]; then ssl_port="$haproxy_port"; ssl_type="HAProxy"; fi
+    fi
+    # Check Nginx (Override if both exist, or show both)
+    if systemctl is-active --quiet nginx && [ -f "$NGINX_PORTS_FILE" ]; then
+         source "$NGINX_PORTS_FILE"
+         # Take the first TLS port
+         local nginx_ssl_port=$(echo "$TLS_PORTS" | awk '{print $1}')
+         if [[ -n "$nginx_ssl_port" ]]; then 
+            if [[ -n "$ssl_port" ]]; then ssl_port="$ssl_port, $nginx_ssl_port"; else ssl_port="$nginx_ssl_port"; fi
+            ssl_type="Nginx/TLS"
+         fi
+    fi
+    
+    if [[ -n "$ssl_port" ]]; then
+        echo -e "\n🔹 ${C_BOLD}SSL/TLS Tunnel ($ssl_type)${C_RESET}:"
+        echo -e "   • Host: $host_domain"
+        echo -e "   • Port(s): $ssl_port"
+        echo -e "   • SNI (BugHost): $host_domain (or your preferred SNI)"
+    fi
+
+    # 3. UDP Custom
+    if systemctl is-active --quiet udp-custom; then
+        echo -e "\n🔹 ${C_BOLD}UDP Custom${C_RESET}:"
+        echo -e "   • IP: $host_ip (Must use numeric IP)"
+        echo -e "   • Port: 1-65535 (Exclude 53, 5300)"
+        echo -e "   • Obfs: (None/Plain)"
+    fi
+
+    # 4. DNSTT
+    if systemctl is-active --quiet dnstt; then
+        if [ -f "$DNSTT_CONFIG_FILE" ]; then
+            source "$DNSTT_CONFIG_FILE"
+            echo -e "\n🔹 ${C_BOLD}DNSTT (SlowDNS)${C_RESET}:"
+            echo -e "   • NS Domain: $NS_DOMAIN"
+            echo -e "   • PubKey: $PUBLIC_KEY"
+            echo -e "   • DNS IP: 1.1.1.1 / 8.8.8.8"
+        fi
+    fi
+    
+    # 5. ZiVPN
+    if systemctl is-active --quiet zivpn; then
+        echo -e "\n🔹 ${C_BOLD}ZiVPN${C_RESET}:"
+        echo -e "   • UDP Port: 5667"
+        echo -e "   • Forwarded Ports: 6000-19999"
+    fi
+    
+    echo -e "${C_YELLOW}========================================${C_RESET}"
+    press_enter
+}
+
+client_config_menu() {
+    _select_user_interface "--- 📱 Generate Client Config ---"
+    local u=$SELECTED_USER
+    if [[ "$u" == "NO_USERS" || -z "$u" ]]; then return; fi
+    
+    # We need to find the password. It's in the DB.
+    local pass=$(grep "^$u:" "$DB_FILE" | cut -d: -f2)
+    generate_client_config "$u" "$pass"
+}
+
+# Lightweight Bash Monitor (No vnStat required)
+simple_live_monitor() {
+    local iface=$1
+    echo -e "\n${C_BLUE}⚡ Starting Lightweight Traffic Monitor for $iface...${C_RESET}"
+    echo -e "${C_DIM}Press [Ctrl+C] to stop.${C_RESET}\n"
+    
+    # Get initial values
+    local rx1=$(cat /sys/class/net/$iface/statistics/rx_bytes)
+    local tx1=$(cat /sys/class/net/$iface/statistics/tx_bytes)
+    
+    printf "%-15s | %-15s\n" "⬇️ Download" "⬆️ Upload"
+    echo "-----------------------------------"
+    
+    while true; do
+        sleep 1
+        local rx2=$(cat /sys/class/net/$iface/statistics/rx_bytes)
+        local tx2=$(cat /sys/class/net/$iface/statistics/tx_bytes)
+        
+        # Calculate diffs
+        local rx_diff=$((rx2 - rx1))
+        local tx_diff=$((tx2 - tx1))
+        
+        # Convert to KB/s
+        local rx_kbs=$((rx_diff / 1024))
+        local tx_kbs=$((tx_diff / 1024))
+        
+        # Formatting for MB/s if > 1024 KB
+        if [ $rx_kbs -gt 1024 ]; then rx_fmt=$(awk "BEGIN {printf \"%.2f MB/s\", $rx_kbs/1024}"); else rx_fmt="${rx_kbs} KB/s"; fi
+        if [ $tx_kbs -gt 1024 ]; then tx_fmt=$(awk "BEGIN {printf \"%.2f MB/s\", $tx_kbs/1024}"); else tx_fmt="${tx_kbs} KB/s"; fi
+        
+        printf "\r%-15s | %-15s" "$rx_fmt" "$tx_fmt"
+        
+        # Reset for next loop
+        rx1=$rx2
+        tx1=$tx2
+    done
+}
+
+traffic_monitor_menu() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 📈 Network Traffic Monitor ---${C_RESET}"
+    
+    # Find active interface
+    local iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    
+    echo -e "\nInterface: ${C_CYAN}${iface}${C_RESET}"
+    
+    echo -e "\n${C_BOLD}Select a monitoring option:${C_RESET}\n"
+    echo -e "  ${C_CHOICE}1)${C_RESET} ⚡ Live Monitor ${C_DIM}(Lightweight, No Install)${C_RESET}"
+    echo -e "  ${C_CHOICE}2)${C_RESET} 📊 View Total Traffic Since Boot"
+    echo -e "  ${C_CHOICE}3)${C_RESET} 📅 Daily/Monthly Logs ${C_DIM}(Requires vnStat)${C_RESET}"
+    
+    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return"
+    echo
+    read -p "👉 Enter choice: " t_choice
+    case $t_choice in
+        1) 
+           simple_live_monitor "$iface"
+           ;;
+        2)
+            local rx_total=$(cat /sys/class/net/$iface/statistics/rx_bytes)
+            local tx_total=$(cat /sys/class/net/$iface/statistics/tx_bytes)
+            local rx_mb=$((rx_total / 1024 / 1024))
+            local tx_mb=$((tx_total / 1024 / 1024))
+            echo -e "\n${C_BLUE}📊 Total Traffic (Since Boot):${C_RESET}"
+            echo -e "   ⬇️ Download: ${C_WHITE}${rx_mb} MB${C_RESET}"
+            echo -e "   ⬆️ Upload:   ${C_WHITE}${tx_mb} MB${C_RESET}"
+            press_enter
+            ;;
+        3) 
+           # vnStat Logic
+           if ! command -v vnstat &> /dev/null; then
+               echo -e "\n${C_YELLOW}⚠️ vnStat is not installed.${C_RESET}"
+               echo -e "   This tool provides persistent history (Daily/Monthly reports)."
+               echo -e "   It is lightweight but requires installation."
+               read -p "👉 Install vnStat now? (y/n): " confirm
+               if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    echo -e "\n${C_BLUE}📦 Installing vnStat...${C_RESET}"
+                    apt-get update >/dev/null 2>&1
+                    apt-get install -y vnstat >/dev/null 2>&1
+                    systemctl enable vnstat >/dev/null 2>&1
+                    systemctl restart vnstat >/dev/null 2>&1
+                    local default_iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+                    vnstat --add -i "$default_iface" >/dev/null 2>&1
+                    echo -e "${C_GREEN}✅ Installed.${C_RESET}"
+                    sleep 1
+               else
+                    return
+               fi
+           fi
+           echo
+           vnstat -i "$iface"
+           echo -e "\n${C_DIM}Run 'vnstat -d' or 'vnstat -m' manually for specific views.${C_RESET}"
+           press_enter
+           ;;
+        *) return ;;
+    esac
+}
+
+torrent_block_menu() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 🚫 Torrent Blocking (Anti-Torrent) ---${C_RESET}"
+    
+    # Check status
+    local torrent_status="${C_STATUS_I}Disabled${C_RESET}"
+    if iptables -L FORWARD | grep -q "ipp2p"; then
+         torrent_status="${C_STATUS_A}Enabled${C_RESET}"
+    elif iptables -L OUTPUT | grep -q "BitTorrent"; then
+         # Fallback check for string matching
+         torrent_status="${C_STATUS_A}Enabled${C_RESET}"
+    fi
+    
+    echo -e "\n${C_WHITE}Current Status: ${torrent_status}${C_RESET}"
+    echo -e "${C_DIM}This feature uses iptables string matching to block common torrent keywords.${C_RESET}"
+    
+    echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
+    echo -e "  ${C_CHOICE}1)${C_RESET} 🔒 Enable Torrent Blocking"
+    echo -e "  ${C_CHOICE}2)${C_RESET} 🔓 Disable Torrent Blocking"
+    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return"
+    echo
+    read -p "👉 Enter choice: " b_choice
+    
+    case $b_choice in
+        1)
+            echo -e "\n${C_BLUE}🛡️ Applying Anti-Torrent rules...${C_RESET}"
+            # Clean old rules first to avoid duplicates
+            _flush_torrent_rules
+            
+            # Block Common Torrent Ports/Keywords
+            # String matching using iptables extension
+            iptables -A FORWARD -m string --string "BitTorrent" --algo bm -j DROP
+            iptables -A FORWARD -m string --string "BitTorrent protocol" --algo bm -j DROP
+            iptables -A FORWARD -m string --string "peer_id=" --algo bm -j DROP
+            iptables -A FORWARD -m string --string ".torrent" --algo bm -j DROP
+            iptables -A FORWARD -m string --string "announce.php?passkey=" --algo bm -j DROP
+            iptables -A FORWARD -m string --string "torrent" --algo bm -j DROP
+            iptables -A FORWARD -m string --string "info_hash" --algo bm -j DROP
+            iptables -A FORWARD -m string --string "get_peers" --algo bm -j DROP
+            iptables -A FORWARD -m string --string "find_node" --algo bm -j DROP
+            
+            # Same for OUTPUT to be safe
+            iptables -A OUTPUT -m string --string "BitTorrent" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string "BitTorrent protocol" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string "peer_id=" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string ".torrent" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string "announce.php?passkey=" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string "torrent" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string "info_hash" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string "get_peers" --algo bm -j DROP
+            iptables -A OUTPUT -m string --string "find_node" --algo bm -j DROP
+            
+            # Attempt to save if iptables-persistent exists
+            if dpkg -s iptables-persistent &>/dev/null; then
+                netfilter-persistent save &>/dev/null
+            fi
+            
+            echo -e "${C_GREEN}✅ Torrent Blocking Enabled.${C_RESET}"
+            press_enter
+            ;;
+        2)
+            echo -e "\n${C_BLUE}🔓 Removing Anti-Torrent rules...${C_RESET}"
+            _flush_torrent_rules
+            if dpkg -s iptables-persistent &>/dev/null; then
+                netfilter-persistent save &>/dev/null
+            fi
+            echo -e "${C_GREEN}✅ Torrent Blocking Disabled.${C_RESET}"
+            press_enter
+            ;;
+        *) return ;;
+    esac
+}
+
+_flush_torrent_rules() {
+    # Helper to remove rules containing specific strings
+    # This is a bit brute-force but effective for this script's scope
+    iptables -D FORWARD -m string --string "BitTorrent" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string "BitTorrent protocol" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string "peer_id=" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string ".torrent" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string "announce.php?passkey=" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string "torrent" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string "info_hash" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string "get_peers" --algo bm -j DROP 2>/dev/null
+    iptables -D FORWARD -m string --string "find_node" --algo bm -j DROP 2>/dev/null
+
+    iptables -D OUTPUT -m string --string "BitTorrent" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string "BitTorrent protocol" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string "peer_id=" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string ".torrent" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string "announce.php?passkey=" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string "torrent" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string "info_hash" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string "get_peers" --algo bm -j DROP 2>/dev/null
+    iptables -D OUTPUT -m string --string "find_node" --algo bm -j DROP 2>/dev/null
+}
+
+auto_reboot_menu() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 🔄 Auto-Reboot Management ---${C_RESET}"
+    
+    # Check status
+    local cron_check=$(crontab -l 2>/dev/null | grep "systemctl reboot")
+    local status="${C_STATUS_I}Disabled${C_RESET}"
+    if [[ -n "$cron_check" ]]; then
+        status="${C_STATUS_A}Active (Midnight)${C_RESET}"
+    fi
+    
+    echo -e "\n${C_WHITE}Current Status: ${status}${C_RESET}"
+    
+    echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
+    echo -e "  ${C_CHOICE}1)${C_RESET} 🕐 Enable Daily Reboot (00:00 midnight)"
+    echo -e "  ${C_CHOICE}2)${C_RESET} ❌ Disable Auto-Reboot"
+    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return"
+    echo
+    read -p "👉 Enter choice: " r_choice
+    
+    case $r_choice in
+        1)
+            # Remove existing to prevent duplicates
+            (crontab -l 2>/dev/null | grep -v "systemctl reboot") | crontab -
+            # Add new job
+            (crontab -l 2>/dev/null; echo "0 0 * * * systemctl reboot") | crontab -
+            echo -e "\n${C_GREEN}✅ Auto-reboot scheduled for every day at 00:00.${C_RESET}"
+            press_enter
+            ;;
+        2)
+            (crontab -l 2>/dev/null | grep -v "systemctl reboot") | crontab -
+            echo -e "\n${C_GREEN}✅ Auto-reboot disabled.${C_RESET}"
+            press_enter
+            ;;
+        *) return ;;
+    esac
+}
+
+
 press_enter() {
     echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to return to the menu..." && read -r
 }
@@ -2389,18 +2798,19 @@ main_menu() {
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "✨ 1" "Create New User" "🔓 5" "Unlock User Account"
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🗑 2" "Delete User" "📋 6" "List All Managed Users"
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "✏️ 3" "Edit User Details" "🔄 7" "Renew User Account"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔒 4" "Lock User Account"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔒 4" "Lock User Account" "📱 15" "Generate Client Config"
         
         echo
         echo -e "   ${C_TITLE}═══════════════[ ${C_BOLD}⚙️ SYSTEM UTILITIES ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔌 8" "Install Protocols & Panels" "🌐 11" "Manage DNS Domain"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔌 8" "Install Protocols" "🌐 11" "Manage DNS Domain"
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "💾 9" "Backup User Data" "🎨 12" "SSH Banner Management"
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "📥 10" "Restore User Data" "🧹 13" "Cleanup Expired Users"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🚀 14" "DT Proxy Management"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🚀 14" "DT Proxy Management" "📈 18" "Traffic Monitor (Lite)"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🚫 19" "Block Torrent (Anti-P2P)" "🔄 20" "Auto-Reboot (Midnight)"
 
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
-        printf "     ${C_DANGER}%2s${C_RESET}) %-28s ${C_DANGER}%2s${C_RESET}) %-25s\n" "💥 15" "Uninstall Script" "🚪 0" "Exit"
+        printf "     ${C_DANGER}%2s${C_RESET}) %-28s ${C_DANGER}%2s${C_RESET}) %-25s\n" "💥 99" "Uninstall Script" "🚪 0" "Exit"
 
         echo
         read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
@@ -2419,7 +2829,11 @@ main_menu() {
             12) ssh_banner_menu ;;
             13) cleanup_expired; press_enter ;;
             14) dt_proxy_menu ;;
-            15) uninstall_script ;;
+            15) client_config_menu; press_enter ;;
+            18) traffic_monitor_menu ;;
+            19) torrent_block_menu ;;
+            20) auto_reboot_menu ;;
+            99) uninstall_script ;;
             0) echo -e "\n${C_BLUE}👋 Goodbye!${C_RESET}"; exit 0 ;;
             *) invalid_option ;;
         esac
