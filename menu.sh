@@ -70,15 +70,35 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # Mandatory Dependency Check (Added jq and curl)
-for cmd in bc jq curl wget; do
-    if ! command -v $cmd &> /dev/null; then
-        echo -e "${C_YELLOW}⚠️ Warning: '$cmd' not found. Attempting to install it...${C_RESET}"
-        apt-get update > /dev/null 2>&1 && apt-get install -y $cmd || {
-            echo -e "${C_RED}❌ Error: Failed to install '$cmd'. Please install it manually ('apt-get install $cmd') and re-run the script.${C_RESET}"
-            exit 1
-        }
+check_environment() {
+    # Mandatory Dependency Check (Added jq and curl)
+    for cmd in bc jq curl wget; do
+        if ! command -v $cmd &> /dev/null; then
+            echo -e "${C_YELLOW}⚠️ Warning: '$cmd' not found. Installing...${C_RESET}"
+            apt-get update > /dev/null 2>&1 && apt-get install -y $cmd || {
+                echo -e "${C_RED}❌ Error: Failed to install '$cmd'. Please install it manually.${C_RESET}"
+                exit 1
+            }
+        fi
+    done
+}
+
+initial_setup() {
+    echo -e "${C_BLUE}⚙️ Initializing FirewallFalcon Manager setup...${C_RESET}"
+    check_environment
+    
+    mkdir -p "$DB_DIR"
+    touch "$DB_FILE"
+    mkdir -p "$SSL_CERT_DIR"
+    
+    echo -e "${C_BLUE}🔹 Configuring user limiter service...${C_RESET}"
+    setup_limiter_service
+    
+    if [ ! -f "$INSTALL_FLAG_FILE" ]; then
+        touch "$INSTALL_FLAG_FILE"
     fi
-done
+    echo -e "${C_GREEN}✅ Setup finished.${C_RESET}"
+}
 
 _is_valid_ipv4() {
     local ip=$1
@@ -260,15 +280,6 @@ EOF
     fi
 }
 
-initial_setup() {
-    mkdir -p "$DB_DIR"
-    touch "$DB_FILE"
-    mkdir -p "$SSL_CERT_DIR"
-    setup_limiter_service
-    if [ ! -f "$INSTALL_FLAG_FILE" ]; then
-        touch "$INSTALL_FLAG_FILE"
-    fi
-}
 
 generate_dns_record() {
     echo -e "\n${C_BLUE}⚙️ Generating a random domain...${C_RESET}"
