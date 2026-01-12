@@ -415,9 +415,9 @@ _select_user_interface() {
     fi
     echo -e "\nPlease select a user:\n"
     for i in "${!users[@]}"; do
-        printf "  ${C_GREEN}%2d)${C_RESET} %s\n" "$((i+1))" "${users[$i]}"
+        printf "  ${C_GREEN}[%2d]${C_RESET} %s\n" "$((i+1))" "${users[$i]}"
     done
-    echo -e "\n  ${C_RED} 0)${C_RESET} ↩️ Cancel and return to main menu"
+    echo -e "\n  ${C_RED} [ 0]${C_RESET} ↩️ Cancel and return to main menu"
     echo
     local choice
     while true; do
@@ -549,8 +549,10 @@ edit_user() {
     while true; do
         clear; show_banner; echo -e "${C_BOLD}${C_PURPLE}--- Editing User: ${C_YELLOW}$username${C_PURPLE} ---${C_RESET}"
         echo -e "\nSelect a detail to edit:\n"
-        echo -e "  ${C_GREEN}1)${C_RESET} 🔑 Change Password"; echo -e "  ${C_GREEN}2)${C_RESET} 🗓️ Change Expiration Date"; echo -e "  ${C_GREEN}3)${C_RESET} 📶 Change Connection Limit"
-        echo -e "\n  ${C_RED}0)${C_RESET} ✅ Finish Editing"; echo; read -p "👉 Enter your choice: " edit_choice
+        printf "  ${C_GREEN}[ 1]${C_RESET} %-35s\n" "🔑 Change Password"
+        printf "  ${C_GREEN}[ 2]${C_RESET} %-35s\n" "🗓️ Change Expiration Date"
+        printf "  ${C_GREEN}[ 3]${C_RESET} %-35s\n" "📶 Change Connection Limit"
+        echo -e "\n  ${C_RED}[ 0]${C_RESET} ✅ Finish Editing"; echo; read -p "👉 Enter your choice: " edit_choice
         case $edit_choice in
             1)
                local new_pass=""
@@ -921,11 +923,11 @@ ssh_banner_menu() {
         fi
         
         echo -e "\n   ${C_TITLE}═════════════════[ ${C_BOLD}🎨 SSH Banner Management ${banner_status} ${C_RESET}${C_TITLE}]═════════════════${C_RESET}"
-        echo -e "     ${C_CHOICE}1)${C_RESET} 📋 Paste or Edit Banner"
-        echo -e "     ${C_CHOICE}2)${C_RESET} 👁️ View Current Banner"
-        echo -e "     ${C_DANGER}3)${C_RESET} 🗑️ Disable and Remove Banner"
+        printf "     ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "📋 Paste or Edit Banner"
+        printf "     ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "👁️ View Current Banner"
+        printf "     ${C_DANGER}[ 3]${C_RESET} %-40s\n" "🗑️ Disable and Remove Banner"
         echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
-        echo -e "     ${C_WARN}0)${C_RESET} ↩️ Return to Main Menu"
+        echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
         echo
         read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
         case $choice in
@@ -1535,9 +1537,9 @@ install_falcon_proxy() {
 
     echo -e "\n${C_CYAN}Select a version to install:${C_RESET}"
     for i in "${!versions[@]}"; do
-        printf "  ${C_GREEN}%2d)${C_RESET} %s\n" "$((i+1))" "${versions[$i]}"
+        printf "  ${C_GREEN}[%2d]${C_RESET} %s\n" "$((i+1))" "${versions[$i]}"
     done
-    echo -e "  ${C_RED} 0)${C_RESET} ↩️ Cancel"
+    echo -e "  ${C_RED} [ 0]${C_RESET} ↩️ Cancel"
     
     local choice
     while true; do
@@ -2095,18 +2097,18 @@ nginx_proxy_menu() {
     echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
     
     if systemctl is-active --quiet nginx; then
-         echo -e "  ${C_CHOICE}1)${C_RESET} 🛑 Stop Nginx Service"
-         echo -e "  ${C_CHOICE}2)${C_RESET} 🔄 Restart Nginx Service"
-         echo -e "  ${C_CHOICE}3)${C_RESET} ⚙️ Re-install/Re-configure (Change Ports)"
-         echo -e "  ${C_CHOICE}4)${C_RESET} 🔒 Request/Renew SSL (Certbot)"
-         echo -e "  ${C_CHOICE}5)${C_RESET} 🔥 Uninstall/Purge Nginx"
+         printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "🛑 Stop Nginx Service"
+         printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "🔄 Restart Nginx Service"
+         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Re-install/Re-configure (Change Ports)"
+         printf "  ${C_CHOICE}[ 4]${C_RESET} %-40s\n" "🔒 Request/Renew SSL (Certbot)"
+         printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Nginx"
     else
-         echo -e "  ${C_CHOICE}1)${C_RESET} ▶️ Start Nginx Service"
-         echo -e "  ${C_CHOICE}3)${C_RESET} ⚙️ Install/Configure Nginx"
-         echo -e "  ${C_CHOICE}5)${C_RESET} 🔥 Uninstall/Purge Nginx"
+         printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "▶️ Start Nginx Service"
+         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Install/Configure Nginx"
+         printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Nginx"
     fi
 
-    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return to previous menu"
+    echo -e "\n  ${C_WARN}[ 0]${C_RESET} ↩️ Return to previous menu"
     echo
     read -p "👉 Enter your choice: " choice
     
@@ -2147,9 +2149,10 @@ install_xui_panel() {
     echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Install X-UI Panel ---${C_RESET}"
     echo -e "\nThis will download and run the official installation script for X-UI."
     echo -e "Choose an installation option:\n"
-    echo -e "  ${C_GREEN}1)${C_RESET} Install the latest version of X-UI"
-    echo -e "  ${C_GREEN}2)${C_RESET} Install a specific version of X-UI"
-    echo -e "\n  ${C_RED}0)${C_RESET} ❌ Cancel Installation"
+    echo -e "Choose an installation option:\n"
+    printf "  ${C_GREEN}[ 1]${C_RESET} %-40s\n" "Install the latest version of X-UI"
+    printf "  ${C_GREEN}[ 2]${C_RESET} %-40s\n" "Install a specific version of X-UI"
+    echo -e "\n  ${C_RED}[ 0]${C_RESET} ❌ Cancel Installation"
     echo
     read -p "👉 Select an option: " choice
     case $choice in
@@ -2268,24 +2271,26 @@ protocol_menu() {
         
         echo -e "\n   ${C_TITLE}══════════════[ ${C_BOLD}🔌 PROTOCOL & PANEL MANAGEMENT ${C_RESET}${C_TITLE}]══════════════${C_RESET}"
         echo -e "     ${C_ACCENT}--- TUNNELLING PROTOCOLS---${C_RESET}"
-        echo -e "     ${C_CHOICE}1)${C_RESET} 🚀 Install badvpn (UDP 7300) $badvpn_status"
-        echo -e "     ${C_CHOICE}2)${C_RESET} 🗑️ Uninstall badvpn"
-        echo -e "     ${C_CHOICE}3)${C_RESET} 🚀 Install udp-custom (Excl. 53,5300) $udp_custom_status"
-        echo -e "     ${C_CHOICE}4)${C_RESET} 🗑️ Uninstall udp-custom"
-        echo -e "     ${C_CHOICE}5)${C_RESET} 🔒 Install ${ssl_tunnel_text} ${ssl_tunnel_status}"
-        echo -e "     ${C_CHOICE}6)${C_RESET} 🗑️ Uninstall SSL Tunnel"
-        echo -e "     ${C_CHOICE}7)${C_RESET} 📡 Install/View DNSTT (Port 53) $dnstt_status"
-        echo -e "     ${C_CHOICE}8)${C_RESET} 🗑️ Uninstall DNSTT"
-        echo -e "     ${C_CHOICE}9)${C_RESET} 🦅 Install Falcon Proxy (Select Version) ${falconproxy_ports} $falconproxy_status"
-        echo -e "     ${C_CHOICE}10)${C_RESET} 🗑️ Uninstall Falcon Proxy"
-        echo -e "     ${C_CHOICE}11)${C_RESET} 🌐 Install/Manage Nginx Proxy (80/443) $nginx_status"
-        echo -e "     ${C_CHOICE}16)${C_RESET} 🛡️ Install ZiVPN (UDP 5667 + Port Share) $zivpn_status"
-        echo -e "     ${C_CHOICE}17)${C_RESET} 🗑️ Uninstall ZiVPN"
+        printf "     ${C_CHOICE}[ 1]${C_RESET} %-45s %s\n" "🚀 Install badvpn (UDP 7300)" "$badvpn_status"
+        printf "     ${C_CHOICE}[ 2]${C_RESET} %-45s\n" "🗑️ Uninstall badvpn"
+        printf "     ${C_CHOICE}[ 3]${C_RESET} %-45s %s\n" "🚀 Install udp-custom" "$udp_custom_status"
+        printf "     ${C_CHOICE}[ 4]${C_RESET} %-45s\n" "🗑️ Uninstall udp-custom"
+        printf "     ${C_CHOICE}[ 5]${C_RESET} %-45s %s\n" "🔒 Install ${ssl_tunnel_text}" "$ssl_tunnel_status"
+        printf "     ${C_CHOICE}[ 6]${C_RESET} %-45s\n" "🗑️ Uninstall SSL Tunnel"
+        printf "     ${C_CHOICE}[ 7]${C_RESET} %-45s %s\n" "📡 Install/View DNSTT (Port 53)" "$dnstt_status"
+        printf "     ${C_CHOICE}[ 8]${C_RESET} %-45s\n" "🗑️ Uninstall DNSTT"
+        printf "     ${C_CHOICE}[ 9]${C_RESET} %-45s %s\n" "🦅 Install Falcon Proxy (Select Version)" "$falconproxy_status"
+        printf "     ${C_CHOICE}[10]${C_RESET} %-45s\n" "🗑️ Uninstall Falcon Proxy"
+        printf "     ${C_CHOICE}[11]${C_RESET} %-45s %s\n" "🌐 Install/Manage Nginx Proxy (80/443)" "$nginx_status"
+        printf "     ${C_CHOICE}[16]${C_RESET} %-45s %s\n" "🛡️ Install ZiVPN (UDP 5667)" "$zivpn_status"
+        printf "     ${C_CHOICE}[17]${C_RESET} %-45s\n" "🗑️ Uninstall ZiVPN"
+        
         echo -e "     ${C_ACCENT}--- 💻 MANAGEMENT PANELS ---${C_RESET}"
-        echo -e "     ${C_CHOICE}12)${C_RESET} 💻 Install X-UI Panel $xui_status"
-        echo -e "     ${C_CHOICE}13)${C_RESET} 🗑️ Uninstall X-UI Panel"
+        printf "     ${C_CHOICE}[12]${C_RESET} %-45s %s\n" "💻 Install X-UI Panel" "$xui_status"
+        printf "     ${C_CHOICE}[13]${C_RESET} %-45s\n" "🗑️ Uninstall X-UI Panel"
+        
         echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
-        echo -e "     ${C_WARN}0)${C_RESET} ↩️ Return to Main Menu"
+        echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
         echo
         read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
         case $choice in
@@ -2386,11 +2391,11 @@ dt_proxy_menu() {
         fi
 
         echo -e "\n   ${C_TITLE}═════════════════[ ${C_BOLD}🚀 DT Proxy Management ${dt_proxy_status} ${C_RESET}${C_TITLE}]═════════════════${C_RESET}"
-        echo -e "     ${C_CHOICE}1)${C_RESET} 🚀 Install DT Tunnel (Mod + Proxy)"
-        echo -e "     ${C_CHOICE}2)${C_RESET} ▶️ Launch DT Tunnel Management Menu"
-        echo -e "     ${C_DANGER}3)${C_RESET} 🗑️ Uninstall DT Tunnel (Mod + Proxy)"
+        printf "     ${C_CHOICE}[ 1]${C_RESET} %-45s\n" "🚀 Install DT Tunnel (Mod + Proxy)"
+        printf "     ${C_CHOICE}[ 2]${C_RESET} %-45s\n" "▶️ Launch DT Tunnel Management Menu"
+        printf "     ${C_DANGER}[ 3]${C_RESET} %-45s\n" "🗑️ Uninstall DT Tunnel (Mod + Proxy)"
         echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
-        echo -e "     ${C_WARN}0)${C_RESET} ↩️ Return to Main Menu"
+        echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
         echo
         read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
         case $choice in
@@ -2607,11 +2612,11 @@ traffic_monitor_menu() {
     echo -e "\nInterface: ${C_CYAN}${iface}${C_RESET}"
     
     echo -e "\n${C_BOLD}Select a monitoring option:${C_RESET}\n"
-    echo -e "  ${C_CHOICE}1)${C_RESET} ⚡ Live Monitor ${C_DIM}(Lightweight, No Install)${C_RESET}"
-    echo -e "  ${C_CHOICE}2)${C_RESET} 📊 View Total Traffic Since Boot"
-    echo -e "  ${C_CHOICE}3)${C_RESET} 📅 Daily/Monthly Logs ${C_DIM}(Requires vnStat)${C_RESET}"
+    printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "⚡ Live Monitor ${C_DIM}(Lightweight, No Install)${C_RESET}"
+    printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "📊 View Total Traffic Since Boot"
+    printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "📅 Daily/Monthly Logs ${C_DIM}(Requires vnStat)${C_RESET}"
     
-    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return"
+    echo -e "\n  ${C_WARN}[ 0]${C_RESET} ↩️ Return"
     echo
     read -p "👉 Enter choice: " t_choice
     case $t_choice in
@@ -2675,9 +2680,9 @@ torrent_block_menu() {
     echo -e "${C_DIM}This feature uses iptables string matching to block common torrent keywords.${C_RESET}"
     
     echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
-    echo -e "  ${C_CHOICE}1)${C_RESET} 🔒 Enable Torrent Blocking"
-    echo -e "  ${C_CHOICE}2)${C_RESET} 🔓 Disable Torrent Blocking"
-    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return"
+    printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "🔒 Enable Torrent Blocking"
+    printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "🔓 Disable Torrent Blocking"
+    echo -e "\n  ${C_WARN}[ 0]${C_RESET} ↩️ Return"
     echo
     read -p "👉 Enter choice: " b_choice
     
@@ -2769,9 +2774,9 @@ auto_reboot_menu() {
     echo -e "\n${C_WHITE}Current Status: ${status}${C_RESET}"
     
     echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
-    echo -e "  ${C_CHOICE}1)${C_RESET} 🕐 Enable Daily Reboot (00:00 midnight)"
-    echo -e "  ${C_CHOICE}2)${C_RESET} ❌ Disable Auto-Reboot"
-    echo -e "\n  ${C_WARN}0)${C_RESET} ↩️ Return"
+    printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "🕐 Enable Daily Reboot (00:00 midnight)"
+    printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "❌ Disable Auto-Reboot"
+    echo -e "\n  ${C_WARN}[ 0]${C_RESET} ↩️ Return"
     echo
     read -p "👉 Enter choice: " r_choice
     
