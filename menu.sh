@@ -1,4 +1,5 @@
 #!/bin/bash
+echo "DEBUG: Loading FirewallFalcon Manager script..."
 
 C_RESET=$'\033[0m'
 C_BOLD=$'\033[1m'
