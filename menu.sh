@@ -1,5 +1,4 @@
 #!/bin/bash
-echo "DEBUG: Loading FirewallFalcon Manager script..."
 
 C_RESET=$'\033[0m'
 C_BOLD=$'\033[1m'
@@ -2803,7 +2802,6 @@ invalid_option() {
 }
 
 main_menu() {
-    initial_setup
     while true; do
         export UNINSTALL_MODE="interactive"
         show_banner
