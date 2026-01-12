@@ -2825,7 +2825,7 @@ main_menu() {
 
         echo
         echo -e "   ${C_TITLE}════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═════════════${C_RESET}"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "13" "DNS Domain Config" "16" "Backup User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "13" "CloudFlare Free Domain" "16" "Backup User Data"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "14" "SSH Banner Config" "17" "Restore User Data"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "15" "Auto-Reboot Task" "18" "Cleanup Expired Users"
 
