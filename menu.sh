@@ -2811,15 +2811,15 @@ main_menu() {
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "✨ 1" "Create New User" "🔓 5" "Unlock User Account"
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🗑 2" "Delete User" "📋 6" "List All Managed Users"
         printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "✏️ 3" "Edit User Details" "🔄 7" "Renew User Account"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔒 4" "Lock User Account" "📱 15" "Generate Client Config"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔒 4" "Lock User Account" "📱 8" "Generate Client Config"
         
         echo
         echo -e "   ${C_TITLE}═══════════════[ ${C_BOLD}⚙️ SYSTEM UTILITIES ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔌 8" "Install Protocols" "🧹 13" "Cleanup Expired Users"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "💾 9" "Backup User Data" "🚀 14" "DT Proxy Management"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "📥 10" "Restore User Data" "📈 16" "Traffic Monitor (Lite)"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🌐 11" "Manage DNS Domain" "🚫 17" "Block Torrent (Anti-P2P)"
-        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🎨 12" "SSH Banner Management" "🔄 18" "Auto-Reboot (Midnight)"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🔌 9" "Install Protocols" "🧹 14" "Cleanup Expired Users"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "💾 10" "Backup User Data" "🚀 15" "DT Proxy Management"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "📥 11" "Restore User Data" "📈 16" "Traffic Monitor (Lite)"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🌐 12" "Manage DNS Domain" "🚫 17" "Block Torrent (Anti-P2P)"
+        printf "     ${C_CHOICE}%2s${C_RESET}) %-25s ${C_CHOICE}%2s${C_RESET}) %-25s\n" "🎨 13" "SSH Banner Management" "🔄 18" "Auto-Reboot (Midnight)"
 
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
@@ -2835,14 +2835,14 @@ main_menu() {
             5) unlock_user; press_enter ;;
             6) list_users; press_enter ;;
             7) renew_user; press_enter ;;
-            8) protocol_menu ;;
-            9) backup_user_data; press_enter ;;
-            10) restore_user_data; press_enter ;;
-            11) dns_menu; press_enter ;;
-            12) ssh_banner_menu ;;
-            13) cleanup_expired; press_enter ;;
-            14) dt_proxy_menu ;;
-            15) client_config_menu; press_enter ;;
+            8) client_config_menu; press_enter ;;
+            9) protocol_menu ;;
+            10) backup_user_data; press_enter ;;
+            11) restore_user_data; press_enter ;;
+            12) dns_menu; press_enter ;;
+            13) ssh_banner_menu ;;
+            14) cleanup_expired; press_enter ;;
+            15) dt_proxy_menu ;;
             16) traffic_monitor_menu ;;
             17) torrent_block_menu ;;
             18) auto_reboot_menu ;;
