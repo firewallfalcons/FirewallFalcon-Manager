@@ -2537,7 +2537,7 @@ generate_client_config() {
         if [ -f "$DNSTT_CONFIG_FILE" ]; then
             source "$DNSTT_CONFIG_FILE"
             echo -e "\n🔹 ${C_BOLD}DNSTT (SlowDNS)${C_RESET}:"
-            echo -e "   • NS Domain: $NS_DOMAIN"
+            echo -e "   • Nameserver: $TUNNEL_DOMAIN"
             echo -e "   • PubKey: $PUBLIC_KEY"
             echo -e "   • DNS IP: 1.1.1.1 / 8.8.8.8"
         fi
