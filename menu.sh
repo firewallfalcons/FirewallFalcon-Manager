@@ -2543,17 +2543,17 @@ install_login_notifier() {
     local main_config="/etc/ssh/sshd_config"
     local include_line="Include /etc/ssh/sshd_config.d/*.conf"
     
-    if grep -q "^Include /etc/ssh/sshd_config.d/\*\.conf" "$main_config"; then
-        : # Already valid
-    elif grep -q "^Include " "$main_config"; then
-         # Some include exists, check if it covers us, otherwise append ours
-         if ! grep -q "sshd_config.d" "$main_config"; then
-             # Prepend to ensure it's loaded early (though Match blocks usually work anywhere)
-             sed -i "1i $include_line" "$main_config"
-         fi
-    else
-        # No Indludes at all, add it to the top
-        sed -i "1i $include_line" "$main_config"
+    # Check for Include support and placement
+    # We MUST place Include at the END if it contains Match blocks, or ensure the included file ends match blocks.
+    # To be safe against "Match block extension", we append to the end.
+    
+    # Remove any existing Include lines we might have added at the top
+    sed -i "\|^$include_line|d" "$main_config"
+    
+    # Append to the end if not present
+    if ! grep -q "^Include /etc/ssh/sshd_config.d/\*\.conf" "$main_config"; then
+        echo "" >> "$main_config"
+        echo "$include_line" >> "$main_config"
     fi
     
     # 3. Clean up OLD methods (Wrapper / Profile) to prevent double banners
@@ -3000,9 +3000,9 @@ main_menu() {
 
         echo
         echo -e "   ${C_TITLE}════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═════════════${C_RESET}"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "13" "CloudFlare Free Domain" "16" "Restore User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "14" "Auto-Reboot Task" "17" "Cleanup Expired Users"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "15" "Backup User Data" ""
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "13" "CloudFlare Free Domain" "14" "Auto-Reboot Task"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "15" "Backup User Data" "16" "Restore User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "17" "Cleanup Expired Users" ""
         
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
