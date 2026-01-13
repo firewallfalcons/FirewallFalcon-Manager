@@ -2499,24 +2499,24 @@ if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
         DIFF_SEC=$((EXPIRY_TS - CURRENT_TS))
         DAYS_LEFT=$((DIFF_SEC / 86400))
         
-        echo ""
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}"
-        echo -e "   👋 Welcome, ${C_BOLD}${C_YELLOW}${USER_NAME}${C_RESET}!"
+        echo "" >&2
+        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" >&2
+        echo -e "   👋 Welcome, ${C_BOLD}${C_YELLOW}${USER_NAME}${C_RESET}!" >&2
         
         if [ $DAYS_LEFT -lt 0 ]; then
-             echo -e "   ⚠️  ${C_RED}Your account has EXPIRED!${C_RESET}"
-             echo -e "   📅  Expired on: ${C_RED}${EXPIRY_DATE}${C_RESET}"
+             echo -e "   ⚠️  ${C_RED}Your account has EXPIRED!${C_RESET}" >&2
+             echo -e "   📅  Expired on: ${C_RED}${EXPIRY_DATE}${C_RESET}" >&2
         elif [ $DAYS_LEFT -le 3 ]; then
-             echo -e "   ⚠️  ${C_RED}Account expiring soon!${C_RESET}"
-             echo -e "   ⏳  Remaining: ${C_RED}${DAYS_LEFT} days${C_RESET}"
-             echo -e "   📅  Expires:   ${C_RED}${EXPIRY_DATE}${C_RESET}"
+             echo -e "   ⚠️  ${C_RED}Account expiring soon!${C_RESET}" >&2
+             echo -e "   ⏳  Remaining: ${C_RED}${DAYS_LEFT} days${C_RESET}" >&2
+             echo -e "   📅  Expires:   ${C_RED}${EXPIRY_DATE}${C_RESET}" >&2
         else
-             echo -e "   ✅  Account Status: ${C_GREEN}Active${C_RESET}"
-             echo -e "   ⏳  Remaining: ${C_GREEN}${DAYS_LEFT} days${C_RESET}"
-             echo -e "   📅  Expires:   ${C_BLUE}${EXPIRY_DATE}${C_RESET}"
+             echo -e "   ✅  Account Status: ${C_GREEN}Active${C_RESET}" >&2
+             echo -e "   ⏳  Remaining: ${C_GREEN}${DAYS_LEFT} days${C_RESET}" >&2
+             echo -e "   📅  Expires:   ${C_BLUE}${EXPIRY_DATE}${C_RESET}" >&2
         fi
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}"
-        echo ""
+        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" >&2
+        echo "" >&2
     fi
 fi
 EOF
@@ -2553,6 +2553,18 @@ EOF
     # Ensure it's in /etc/shells
     if ! grep -q "$custom_shell" /etc/shells; then
         echo "$custom_shell" >> /etc/shells
+    fi
+    
+    # Force update existing users to use the new shell
+    if [ -f "$DB_FILE" ]; then
+        while IFS=: read -r user pass expiry limit; do
+            if id "$user" &>/dev/null; then
+                 local current_shell=$(getent passwd "$user" | cut -d: -f7)
+                 if [[ "$current_shell" != "$custom_shell" ]]; then
+                     chsh -s "$custom_shell" "$user" &>/dev/null
+                 fi
+            fi
+        done < "$DB_FILE"
     fi
 }
 
