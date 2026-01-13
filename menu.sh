@@ -94,7 +94,6 @@ initial_setup() {
     echo -e "${C_BLUE}🔹 Configuring user limiter service...${C_RESET}"
     echo -e "${C_BLUE}🔹 Configuring user limiter service...${C_RESET}"
     setup_limiter_service
-    install_login_notifier
     
     if [ ! -f "$INSTALL_FLAG_FILE" ]; then
         touch "$INSTALL_FLAG_FILE"
@@ -2469,68 +2468,7 @@ uninstall_script() {
     exit 0
 }
 
-install_login_notifier() {
-    # Script that runs on user login to show expiry
-    local login_script="/usr/local/bin/firewallfalcon-login.sh"
-    
-    cat > "$login_script" <<'EOF'
-#!/bin/bash
-DB_FILE="/etc/firewallfalcon/users.db"
-C_RED='\033[38;5;196m'
-C_GREEN='\033[38;5;46m'
-C_YELLOW='\033[38;5;226m'
-C_BLUE='\033[38;5;39m'
-C_RESET='\033[0m'
-C_BOLD='\033[1m'
 
-# Get current user
-USER_NAME=$(whoami)
-
-# Only run for users in our DB
-if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
-    # Extract expiry date
-    EXPIRY_DATE=$(grep "^$USER_NAME:" "$DB_FILE" | cut -d: -f3)
-    
-    # Calculate days remaining
-    CURRENT_TS=$(date +%s)
-    EXPIRY_TS=$(date -d "$EXPIRY_DATE" +%s 2>/dev/null)
-    
-    if [ -n "$EXPIRY_TS" ]; then
-        DIFF_SEC=$((EXPIRY_TS - CURRENT_TS))
-        DAYS_LEFT=$((DIFF_SEC / 86400))
-        
-        echo ""
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}"
-        echo -e "   👋 Welcome, ${C_BOLD}${C_YELLOW}${USER_NAME}${C_RESET}!"
-        
-        if [ $DAYS_LEFT -lt 0 ]; then
-             echo -e "   ⚠️  ${C_RED}Your account has EXPIRED!${C_RESET}"
-             echo -e "   📅  Expired on: ${C_RED}${EXPIRY_DATE}${C_RESET}"
-        elif [ $DAYS_LEFT -le 3 ]; then
-             echo -e "   ⚠️  ${C_RED}Account expiring soon!${C_RESET}"
-             echo -e "   ⏳  Remaining: ${C_RED}${DAYS_LEFT} days${C_RESET}"
-             echo -e "   📅  Expires:   ${C_RED}${EXPIRY_DATE}${C_RESET}"
-        else
-             echo -e "   ✅  Account Status: ${C_GREEN}Active${C_RESET}"
-             echo -e "   ⏳  Remaining: ${C_GREEN}${DAYS_LEFT} days${C_RESET}"
-             echo -e "   📅  Expires:   ${C_BLUE}${EXPIRY_DATE}${C_RESET}"
-        fi
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}"
-        echo ""
-    fi
-fi
-EOF
-    chmod +x "$login_script"
-
-    # Add to profile.d so it runs on login
-    cat > /etc/profile.d/00-firewallfalcon-login.sh <<EOF
-#!/bin/bash
-if [ -x "$login_script" ]; then
-    "$login_script"
-fi
-EOF
-    chmod +x /etc/profile.d/00-firewallfalcon-login.sh
-}
 
 # --- NEW FEATURES ---
 
