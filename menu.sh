@@ -2470,58 +2470,115 @@ uninstall_script() {
 }
 
 install_login_notifier() {
-    # PAM Script for "Server Message" during auth
-    local pam_script="/usr/local/bin/firewallfalcon-pam-expiry.sh"
+    # 1. Create the Banner Script (Calculates expiry and shows banner)
+    local banner_script="/usr/local/bin/firewallfalcon-banner"
     
-    cat > "$pam_script" <<'EOF'
+    cat > "$banner_script" <<'EOF'
 #!/bin/bash
+# FirewallFalcon Banner Script
 DB_FILE="/etc/firewallfalcon/users.db"
-# PAM passes the username in PAM_USER variable
-USER_NAME="$PAM_USER"
+USER_NAME=$(whoami)
 
-if [ -z "$USER_NAME" ]; then exit 0; fi
-
+# Only show for managed users
 if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
-    EXPIRY_DATE=$(grep "^$USER_NAME:" "$DB_FILE" | cut -d: -f3)
+    # Clear screen for a cleaner look (optional, maybe remove 'clear' if it annoys users)
+    # clear 
+    
+    # Read user data
+    USER_DATA=$(grep "^$USER_NAME:" "$DB_FILE")
+    EXPIRY_DATE=$(echo "$USER_DATA" | cut -d: -f3)
     
     CURRENT_TS=$(date +%s)
     EXPIRY_TS=$(date -d "$EXPIRY_DATE" +%s 2>/dev/null)
+    
+    # Defaults
+    DAYS_LEFT="Unknown"
+    STATUS_COLOR="\033[1;32m" # Green
+    STATUS_TEXT="ACTIVE"
     
     if [ -n "$EXPIRY_TS" ]; then
         DIFF_SEC=$((EXPIRY_TS - CURRENT_TS))
         DAYS_LEFT=$((DIFF_SEC / 86400))
         
-        # Output here is sent to the client as an authentication message
-        echo "--------------------------------------------------"
-        echo " 👋 User: $USER_NAME"
         if [ $DAYS_LEFT -lt 0 ]; then
-             echo " ⚠️  STATUS: EXPIRED"
-             echo " 📅  Expired: $EXPIRY_DATE"
-        else
-             echo " ✅  STATUS: ACTIVE"
-             echo " ⏳  Days Left: $DAYS_LEFT"
-             echo " 📅  Expires: $EXPIRY_DATE"
+            STATUS_COLOR="\033[1;31m" # Red
+            STATUS_TEXT="EXPIRED"
+            DAYS_LEFT="0"
+        elif [ $DAYS_LEFT -le 3 ]; then
+            STATUS_COLOR="\033[1;33m" # Yellow
         fi
-        echo "--------------------------------------------------"
     fi
+    
+    # --- The Visual Banner ---
+    echo -e "\033[1;34m==================================================\033[0m"
+    echo -e " \033[1;36m👋 Welcome, \033[1;37m$USER_NAME\033[0m"
+    echo -e " \033[1;34m--------------------------------------------------\033[0m"
+    echo -e "  📊 Status    : ${STATUS_COLOR}${STATUS_TEXT}\033[0m"
+    echo -e "  ⏳ Days Left : ${STATUS_COLOR}${DAYS_LEFT} Days\033[0m"
+    echo -e "  📅 Expires   : \033[1;37m${EXPIRY_DATE}\033[0m"
+    echo -e "\033[1;34m==================================================\033[0m"
+    echo ""
 fi
 EOF
-    chmod +x "$pam_script"
+    chmod +x "$banner_script"
 
-    # Configure PAM (Pluggable Authentication Modules)
-    # This injects the message into the SSH handshake
+    # 2. Add to global profile (runs for all interactive shells)
+    # We use z_ prefix to ensure it runs last
+    local profile_script="/etc/profile.d/z_firewallfalcon_banner.sh"
+    
+    cat > "$profile_script" <<EOF
+#!/bin/bash
+if [ -x "$banner_script" ]; then
+    "$banner_script"
+fi
+EOF
+    chmod +x "$profile_script"
+
+    # 3. Clean up old PAM config if it exists
     local pam_config="/etc/pam.d/sshd"
-    local pam_line="session optional pam_exec.so stdout $pam_script"
+    local pam_script_old="/usr/local/bin/firewallfalcon-pam-expiry.sh"
     
     if [ -f "$pam_config" ]; then
-        # Remove old entry if exists to avoid duplicates
-        sed -i "\|$pam_script|d" "$pam_config"
-        # Add new entry after 'session common-session' or at the end
-        if grep -q "@include common-session" "$pam_config"; then
-            sed -i "\|@include common-session|a $pam_line" "$pam_config"
+        sed -i "\|pam_exec.so stdout $pam_script_old|d" "$pam_config"
+    fi
+    rm -f "$pam_script_old"
+
+    # 4. Automate SSHD Config Settings for Best Experience
+    echo -e "${C_BLUE}🔧 Configuring SSH Daemon (sshd_config)...${C_RESET}"
+    local sshd_config="/etc/ssh/sshd_config"
+    
+    if [ -f "$sshd_config" ]; then
+        # Backup first
+        cp "$sshd_config" "${sshd_config}.bak.$(date +%F_%T)" 2>/dev/null
+        
+        # Ensure PrintMotd is no (Disable default static MOTD)
+        if grep -q "^PrintMotd" "$sshd_config"; then
+            sed -i 's/^PrintMotd.*/PrintMotd no/' "$sshd_config"
         else
-            echo "$pam_line" >> "$pam_config"
+            echo "PrintMotd no" >> "$sshd_config"
         fi
+
+        # Ensure UsePAM is yes
+        if grep -q "^UsePAM" "$sshd_config"; then
+            sed -i 's/^UsePAM.*/UsePAM yes/' "$sshd_config"
+        else
+            echo "UsePAM yes" >> "$sshd_config"
+        fi
+        
+        # Disable pre-auth Banner to avoid duplication/confusion
+        # We comment out any active Banner line
+        sed -i 's/^Banner /#Banner /' "$sshd_config"
+        
+        echo -e "${C_GREEN}✅ SSH Configuration updated.${C_RESET}"
+        
+        # Restart SSH to apply
+        if systemctl is-active --quiet ssh; then
+            systemctl restart ssh
+        elif systemctl is-active --quiet sshd; then
+             systemctl restart sshd
+        fi
+    else
+        echo -e "${C_YELLOW}⚠️ /etc/ssh/sshd_config not found. Skipping SSH config update.${C_RESET}"
     fi
 }
 
