@@ -9,7 +9,7 @@ fi
 
 echo "Installing FirewallFalcon Manager..."
 
-# URLs
+# URLs (IPv4 forced to avoid GitHub IPv6 issues)
 MENU_URL="https://raw.githubusercontent.com/firewallfalcons/FirewallFalcon-Manager/main/menu.sh"
 SSHD_URL="https://raw.githubusercontent.com/firewallfalcons/FirewallFalcon-Manager/main/ssh"
 
@@ -17,21 +17,20 @@ SSHD_URL="https://raw.githubusercontent.com/firewallfalcons/FirewallFalcon-Manag
 wget -4 -q -O /usr/local/bin/menu "$MENU_URL"
 chmod +x /usr/local/bin/menu
 
-# Apply SSH configuration
 echo "Applying FirewallFalcon SSH configuration..."
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP="/etc/ssh/sshd_config.backup.$(date +%F-%H%M%S)"
 
-# Backup existing config
+# Backup current SSH config
 cp "$SSHD_CONFIG" "$BACKUP"
 
-# Download new config
+# Download FirewallFalcon SSH config
 wget -4 -q -O "$SSHD_CONFIG" "$SSHD_URL"
 chmod 600 "$SSHD_CONFIG"
 
-# Validate SSH config before restart
-if ! sshd -t; then
+# Validate SSH config (silent)
+if ! sshd -t 2>/dev/null; then
     echo "ERROR: SSH configuration is invalid!"
     echo "Restoring previous configuration..."
     cp "$BACKUP" "$SSHD_CONFIG"
@@ -40,28 +39,37 @@ fi
 
 echo "SSH configuration validated."
 
-# Restart SSH (auto-detect)
+# Restart SSH quietly and safely
 restart_ssh() {
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart sshd || systemctl restart ssh
+        systemctl restart sshd 2>/dev/null \
+        || systemctl restart ssh 2>/dev/null \
+        || return 1
     elif command -v service >/dev/null 2>&1; then
-        service sshd restart || service ssh restart
-    elif [ -x /etc/init.d/sshd ]; then
-        /etc/init.d/sshd restart
-    elif [ -x /etc/init.d/ssh ]; then
-        /etc/init.d/ssh restart
+        service sshd restart 2>/dev/null \
+        || service ssh restart 2>/dev/null \
+        || return 1
     elif command -v rc-service >/dev/null 2>&1; then
-        rc-service sshd restart || rc-service ssh restart
+        rc-service sshd restart 2>/dev/null \
+        || rc-service ssh restart 2>/dev/null \
+        || return 1
+    elif [ -x /etc/init.d/sshd ]; then
+        /etc/init.d/sshd restart >/dev/null 2>&1
+    elif [ -x /etc/init.d/ssh ]; then
+        /etc/init.d/ssh restart >/dev/null 2>&1
     else
-        echo "WARNING: Could not automatically restart SSH."
-        echo "Please restart SSH manually."
         return 1
     fi
 }
 
-restart_ssh
+if restart_ssh; then
+    echo "SSH service restarted."
+else
+    echo "WARNING: SSH restart not supported on this system."
+    echo "SSH config applied but service was not restarted automatically."
+fi
 
-# Install FirewallFalcon setup
+# Run FirewallFalcon setup
 bash /usr/local/bin/menu --install-setup
 
 echo "Installation complete!"
