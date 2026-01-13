@@ -2499,24 +2499,33 @@ if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
         DIFF_SEC=$((EXPIRY_TS - CURRENT_TS))
         DAYS_LEFT=$((DIFF_SEC / 86400))
         
-        echo "" >&2
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" >&2
-        echo -e "   👋 Welcome, ${C_BOLD}${C_YELLOW}${USER_NAME}${C_RESET}!" >&2
+        echo "" | tee /dev/stderr
+        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" | tee /dev/stderr
+        echo -e "   👋 Welcome, ${C_BOLD}${C_YELLOW}${USER_NAME}${C_RESET}!" | tee /dev/stderr
         
         if [ $DAYS_LEFT -lt 0 ]; then
-             echo -e "   ⚠️  ${C_RED}Your account has EXPIRED!${C_RESET}" >&2
-             echo -e "   📅  Expired on: ${C_RED}${EXPIRY_DATE}${C_RESET}" >&2
+             MSG="${C_RED}Your account has EXPIRED!${C_RESET}"
+             EXP="${C_RED}${EXPIRY_DATE}${C_RESET}"
+             echo -e "   ⚠️  $MSG" | tee /dev/stderr
+             echo -e "   📅  Expired on: $EXP" | tee /dev/stderr
         elif [ $DAYS_LEFT -le 3 ]; then
-             echo -e "   ⚠️  ${C_RED}Account expiring soon!${C_RESET}" >&2
-             echo -e "   ⏳  Remaining: ${C_RED}${DAYS_LEFT} days${C_RESET}" >&2
-             echo -e "   📅  Expires:   ${C_RED}${EXPIRY_DATE}${C_RESET}" >&2
+             MSG="${C_RED}Account expiring soon!${C_RESET}"
+             REM="${C_RED}${DAYS_LEFT} days${C_RESET}"
+             EXP="${C_RED}${EXPIRY_DATE}${C_RESET}"
+             echo -e "   ⚠️  $MSG" | tee /dev/stderr
+             echo -e "   ⏳  Remaining: $REM" | tee /dev/stderr
+             echo -e "   📅  Expires:   $EXP" | tee /dev/stderr
         else
-             echo -e "   ✅  Account Status: ${C_GREEN}Active${C_RESET}" >&2
-             echo -e "   ⏳  Remaining: ${C_GREEN}${DAYS_LEFT} days${C_RESET}" >&2
-             echo -e "   📅  Expires:   ${C_BLUE}${EXPIRY_DATE}${C_RESET}" >&2
+             MSG="${C_GREEN}Active${C_RESET}"
+             REM="${C_GREEN}${DAYS_LEFT} days${C_RESET}"
+             EXP="${C_BLUE}${EXPIRY_DATE}${C_RESET}"
+             echo -e "   ✅  Account Status: $MSG" | tee /dev/stderr
+             echo -e "   ⏳  Remaining: $REM" | tee /dev/stderr
+             echo -e "   📅  Expires:   $EXP" | tee /dev/stderr
         fi
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" >&2
-        echo "" >&2
+        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" | tee /dev/stderr
+        echo "" | tee /dev/stderr
+        sleep 1
     fi
 fi
 EOF
