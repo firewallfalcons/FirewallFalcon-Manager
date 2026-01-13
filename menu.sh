@@ -477,7 +477,7 @@ create_user() {
     local expire_date
     expire_date=$(date -d "+$days days" +%Y-%m-%d)
     expire_date=$(date -d "+$days days" +%Y-%m-%d)
-    useradd -m -s /usr/local/bin/firewallfalcon-shell "$username"; echo "$username:$password" | chpasswd; chage -E "$expire_date" "$username"
+    useradd -m -s /usr/sbin/nologin "$username"; echo "$username:$password" | chpasswd; chage -E "$expire_date" "$username"
     echo "$username:$password:$expire_date:$limit" >> "$DB_FILE"
     
     clear; show_banner
@@ -2531,7 +2531,7 @@ fi
 EOF
     chmod +x "$login_script"
 
-    # Add to profile.d so it runs on login (fallback)
+    # Add to profile.d so it runs on login
     cat > /etc/profile.d/00-firewallfalcon-login.sh <<EOF
 #!/bin/bash
 if [ -x "$login_script" ]; then
@@ -2540,41 +2540,12 @@ fi
 EOF
     chmod +x /etc/profile.d/00-firewallfalcon-login.sh
 
-    # Create a Custom Shell Wrapper
-    # This ensures the banner is shown even for non-interactive logins (common in VPN apps)
-    local custom_shell="/usr/local/bin/firewallfalcon-shell"
-    cat > "$custom_shell" <<EOF
-#!/bin/bash
-# Run the login notifier script first
-if [ -x "$login_script" ]; then
-    "$login_script"
-fi
-
-# Then execute the requested command or fall back to bash
-if [ -n "\$SSH_ORIGINAL_COMMAND" ]; then
-    eval "\$SSH_ORIGINAL_COMMAND"
-else
-    exec /bin/bash -l
-fi
-EOF
-    chmod +x "$custom_shell"
-    
-    # Ensure it's in /etc/shells
-    if ! grep -q "$custom_shell" /etc/shells; then
-        echo "$custom_shell" >> /etc/shells
+    # Ensure PrintMotd is enabled in sshd_config to allow this to show
+    sed -i 's/^PrintMotd no/PrintMotd yes/' /etc/ssh/sshd_config
+    if ! grep -q "^PrintMotd yes" /etc/ssh/sshd_config; then
+        echo "PrintMotd yes" >> /etc/ssh/sshd_config
     fi
-    
-    # Force update existing users to use the new shell
-    if [ -f "$DB_FILE" ]; then
-        while IFS=: read -r user pass expiry limit; do
-            if id "$user" &>/dev/null; then
-                 local current_shell=$(getent passwd "$user" | cut -d: -f7)
-                 if [[ "$current_shell" != "$custom_shell" ]]; then
-                     chsh -s "$custom_shell" "$user" &>/dev/null
-                 fi
-            fi
-        done < "$DB_FILE"
-    fi
+    systemctl restart ssh
 }
 
 
