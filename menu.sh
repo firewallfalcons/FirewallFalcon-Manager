@@ -2470,28 +2470,20 @@ uninstall_script() {
 }
 
 install_login_notifier() {
-    # Script that runs on user login to show expiry
-    local login_script="/usr/local/bin/firewallfalcon-login.sh"
+    # PAM Script for "Server Message" during auth
+    local pam_script="/usr/local/bin/firewallfalcon-pam-expiry.sh"
     
-    cat > "$login_script" <<'EOF'
+    cat > "$pam_script" <<'EOF'
 #!/bin/bash
 DB_FILE="/etc/firewallfalcon/users.db"
-C_RED='\033[38;5;196m'
-C_GREEN='\033[38;5;46m'
-C_YELLOW='\033[38;5;226m'
-C_BLUE='\033[38;5;39m'
-C_RESET='\033[0m'
-C_BOLD='\033[1m'
+# PAM passes the username in PAM_USER variable
+USER_NAME="$PAM_USER"
 
-# Get current user
-USER_NAME=$(whoami)
+if [ -z "$USER_NAME" ]; then exit 0; fi
 
-# Only run for users in our DB
 if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
-    # Extract expiry date
     EXPIRY_DATE=$(grep "^$USER_NAME:" "$DB_FILE" | cut -d: -f3)
     
-    # Calculate days remaining
     CURRENT_TS=$(date +%s)
     EXPIRY_TS=$(date -d "$EXPIRY_DATE" +%s 2>/dev/null)
     
@@ -2499,53 +2491,38 @@ if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
         DIFF_SEC=$((EXPIRY_TS - CURRENT_TS))
         DAYS_LEFT=$((DIFF_SEC / 86400))
         
-        echo "" | tee /dev/stderr
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" | tee /dev/stderr
-        echo -e "   👋 Welcome, ${C_BOLD}${C_YELLOW}${USER_NAME}${C_RESET}!" | tee /dev/stderr
-        
+        # Output here is sent to the client as an authentication message
+        echo "--------------------------------------------------"
+        echo " 👋 User: $USER_NAME"
         if [ $DAYS_LEFT -lt 0 ]; then
-             MSG="${C_RED}Your account has EXPIRED!${C_RESET}"
-             EXP="${C_RED}${EXPIRY_DATE}${C_RESET}"
-             echo -e "   ⚠️  $MSG" | tee /dev/stderr
-             echo -e "   📅  Expired on: $EXP" | tee /dev/stderr
-        elif [ $DAYS_LEFT -le 3 ]; then
-             MSG="${C_RED}Account expiring soon!${C_RESET}"
-             REM="${C_RED}${DAYS_LEFT} days${C_RESET}"
-             EXP="${C_RED}${EXPIRY_DATE}${C_RESET}"
-             echo -e "   ⚠️  $MSG" | tee /dev/stderr
-             echo -e "   ⏳  Remaining: $REM" | tee /dev/stderr
-             echo -e "   📅  Expires:   $EXP" | tee /dev/stderr
+             echo " ⚠️  STATUS: EXPIRED"
+             echo " 📅  Expired: $EXPIRY_DATE"
         else
-             MSG="${C_GREEN}Active${C_RESET}"
-             REM="${C_GREEN}${DAYS_LEFT} days${C_RESET}"
-             EXP="${C_BLUE}${EXPIRY_DATE}${C_RESET}"
-             echo -e "   ✅  Account Status: $MSG" | tee /dev/stderr
-             echo -e "   ⏳  Remaining: $REM" | tee /dev/stderr
-             echo -e "   📅  Expires:   $EXP" | tee /dev/stderr
+             echo " ✅  STATUS: ACTIVE"
+             echo " ⏳  Days Left: $DAYS_LEFT"
+             echo " 📅  Expires: $EXPIRY_DATE"
         fi
-        echo -e "${C_BLUE}══════════════════════════════════════════════${C_RESET}" | tee /dev/stderr
-        echo "" | tee /dev/stderr
-        sleep 1
+        echo "--------------------------------------------------"
     fi
 fi
 EOF
-    chmod +x "$login_script"
+    chmod +x "$pam_script"
 
-    # Add to profile.d so it runs on login
-    cat > /etc/profile.d/00-firewallfalcon-login.sh <<EOF
-#!/bin/bash
-if [ -x "$login_script" ]; then
-    "$login_script"
-fi
-EOF
-    chmod +x /etc/profile.d/00-firewallfalcon-login.sh
-
-    # Ensure PrintMotd is enabled in sshd_config to allow this to show
-    sed -i 's/^PrintMotd no/PrintMotd yes/' /etc/ssh/sshd_config
-    if ! grep -q "^PrintMotd yes" /etc/ssh/sshd_config; then
-        echo "PrintMotd yes" >> /etc/ssh/sshd_config
+    # Configure PAM (Pluggable Authentication Modules)
+    # This injects the message into the SSH handshake
+    local pam_config="/etc/pam.d/sshd"
+    local pam_line="session optional pam_exec.so stdout $pam_script"
+    
+    if [ -f "$pam_config" ]; then
+        # Remove old entry if exists to avoid duplicates
+        sed -i "\|$pam_script|d" "$pam_config"
+        # Add new entry after 'session common-session' or at the end
+        if grep -q "@include common-session" "$pam_config"; then
+            sed -i "\|@include common-session|a $pam_line" "$pam_config"
+        else
+            echo "$pam_line" >> "$pam_config"
+        fi
     fi
-    systemctl restart ssh
 }
 
 
