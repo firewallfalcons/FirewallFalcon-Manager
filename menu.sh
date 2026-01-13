@@ -2470,28 +2470,26 @@ uninstall_script() {
 }
 
 install_login_notifier() {
-    # 1. Create the Banner Script (Calculates expiry and shows banner)
-    local banner_script="/usr/local/bin/firewallfalcon-banner"
+    # 1. Create the Wrapper Script (The core logic)
+    local wrapper_script="/usr/local/bin/firewallfalcon-wrapper"
     
-    cat > "$banner_script" <<'EOF'
+    cat > "$wrapper_script" <<'EOF'
 #!/bin/bash
-# FirewallFalcon Banner Script
+# FirewallFalcon SSH Wrapper
+# Forces the banner to be displayed before the shell/command
+
 DB_FILE="/etc/firewallfalcon/users.db"
 USER_NAME=$(whoami)
 
+# --- BANNER GENERATION START ---
 # Only show for managed users
 if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
-    # Clear screen for a cleaner look (optional, maybe remove 'clear' if it annoys users)
-    # clear 
-    
-    # Read user data
     USER_DATA=$(grep "^$USER_NAME:" "$DB_FILE")
     EXPIRY_DATE=$(echo "$USER_DATA" | cut -d: -f3)
     
     CURRENT_TS=$(date +%s)
     EXPIRY_TS=$(date -d "$EXPIRY_DATE" +%s 2>/dev/null)
     
-    # Defaults
     DAYS_LEFT="Unknown"
     STATUS_COLOR="\033[1;32m" # Green
     STATUS_TEXT="ACTIVE"
@@ -2509,7 +2507,8 @@ if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
         fi
     fi
     
-    # --- The Visual Banner ---
+    # Print Banner to Stderr to ensure it reaches the client even if stdout is piped
+    # (Though for interactive shells, stdout is fine. Using stdout for visibility.)
     echo -e "\033[1;34m==================================================\033[0m"
     echo -e " \033[1;36m👋 Welcome, \033[1;37m$USER_NAME\033[0m"
     echo -e " \033[1;34m--------------------------------------------------\033[0m"
@@ -2519,31 +2518,26 @@ if [ -f "$DB_FILE" ] && grep -q "^$USER_NAME:" "$DB_FILE"; then
     echo -e "\033[1;34m==================================================\033[0m"
     echo ""
 fi
-EOF
-    chmod +x "$banner_script"
+# --- BANNER GENERATION END ---
 
-    # 2. Add to global profile (runs for all interactive shells)
-    # We use z_ prefix to ensure it runs last
-    local profile_script="/etc/profile.d/z_firewallfalcon_banner.sh"
-    
-    cat > "$profile_script" <<EOF
-#!/bin/bash
-if [ -x "$banner_script" ]; then
-    "$banner_script"
+# Execute the original command
+if [[ -n "$SSH_ORIGINAL_COMMAND" ]]; then
+    exec $SSH_ORIGINAL_COMMAND
+else
+    # If no command, start login shell
+    if [ -z "$SHELL" ]; then
+        exec /bin/bash -l
+    else
+        exec "$SHELL" -l
+    fi
 fi
 EOF
-    chmod +x "$profile_script"
-
-    # 3. Clean up old PAM config if it exists
-    local pam_config="/etc/pam.d/sshd"
-    local pam_script_old="/usr/local/bin/firewallfalcon-pam-expiry.sh"
+    chmod +x "$wrapper_script"
     
-    if [ -f "$pam_config" ]; then
-        sed -i "\|pam_exec.so stdout $pam_script_old|d" "$pam_config"
-    fi
-    rm -f "$pam_script_old"
+    # Clean up old profile script if exists (switching methods)
+    rm -f "/etc/profile.d/z_firewallfalcon_banner.sh"
 
-    # 4. Automate SSHD Config Settings for Best Experience
+    # 4. Automate SSHD Config Settings
     echo -e "${C_BLUE}🔧 Configuring SSH Daemon (sshd_config)...${C_RESET}"
     local sshd_config="/etc/ssh/sshd_config"
     
@@ -2551,25 +2545,25 @@ EOF
         # Backup first
         cp "$sshd_config" "${sshd_config}.bak.$(date +%F_%T)" 2>/dev/null
         
-        # Ensure PrintMotd is no (Disable default static MOTD)
+        # 1. Clean previous configs we might have added
+        sed -i '/ForceCommand \/usr\/local\/bin\/firewallfalcon-wrapper/d' "$sshd_config"
+        sed -i '/Match User !root/d' "$sshd_config"
+        
+        # 2. Add the ForceCommand block at the END of the file
+        # We match !root so we don't accidentally break the root VPS access
+        echo "" >> "$sshd_config"
+        echo "Match User !root" >> "$sshd_config"
+        echo "    ForceCommand /usr/local/bin/firewallfalcon-wrapper" >> "$sshd_config"
+        
+        # 3. Disable PrintMotd/Banner globally to avoid clutter
         if grep -q "^PrintMotd" "$sshd_config"; then
             sed -i 's/^PrintMotd.*/PrintMotd no/' "$sshd_config"
         else
-            echo "PrintMotd no" >> "$sshd_config"
+            sed -i '1i PrintMotd no' "$sshd_config"
         fi
-
-        # Ensure UsePAM is yes
-        if grep -q "^UsePAM" "$sshd_config"; then
-            sed -i 's/^UsePAM.*/UsePAM yes/' "$sshd_config"
-        else
-            echo "UsePAM yes" >> "$sshd_config"
-        fi
-        
-        # Disable pre-auth Banner to avoid duplication/confusion
-        # We comment out any active Banner line
         sed -i 's/^Banner /#Banner /' "$sshd_config"
         
-        echo -e "${C_GREEN}✅ SSH Configuration updated.${C_RESET}"
+        echo -e "${C_GREEN}✅ SSH Configuration updated with Wrapper.${C_RESET}"
         
         # Restart SSH to apply
         if systemctl is-active --quiet ssh; then
@@ -2948,8 +2942,8 @@ main_menu() {
         echo
         echo -e "   ${C_TITLE}════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═════════════${C_RESET}"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "13" "CloudFlare Free Domain" "16" "Backup User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "14" "SSH Banner Config" "17" "Restore User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "15" "Auto-Reboot Task" "18" "Cleanup Expired Users"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "15" "Auto-Reboot Task" "17" "Restore User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-25s ${C_CHOICE}[%2s]${C_RESET} %-25s\n" "18" "Cleanup Expired Users" ""
 
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
@@ -2972,7 +2966,7 @@ main_menu() {
             12) torrent_block_menu ;;
             
             13) dns_menu; press_enter ;;
-            14) ssh_banner_menu ;;
+            
             15) auto_reboot_menu ;;
             16) backup_user_data; press_enter ;;
             17) restore_user_data; press_enter ;;
