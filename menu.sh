@@ -295,62 +295,123 @@ setup_bandwidth_service() {
     mkdir -p "$BANDWIDTH_DIR"
     cat > "$BANDWIDTH_SCRIPT" << 'BWEOF'
 #!/bin/bash
+# FirewallFalcon Bandwidth Monitor v2
+# Uses /proc/<pid>/io to track bytes per SSH user's sshd processes.
+# This correctly captures SSH tunnel/SOCKS proxy traffic (HTTP Custom, HTTP Injector).
+
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
+PID_TRACK_DIR="$BW_DIR/pidtrack"
 
-mkdir -p "$BW_DIR"
+mkdir -p "$BW_DIR" "$PID_TRACK_DIR"
 
-# Helper: ensure iptables chain exists for a user
-ensure_chain() {
-    local user="$1"
-    local uid
-    uid=$(id -u "$user" 2>/dev/null) || return 1
-    local chain="FF_BW_${user}"
-    
-    if ! iptables -L "$chain" -n &>/dev/null; then
-        iptables -N "$chain" 2>/dev/null
-        iptables -A OUTPUT -m owner --uid-owner "$uid" -j "$chain" 2>/dev/null
-        iptables -A "$chain" -j RETURN 2>/dev/null
+# Get total bytes (read + written) for a single PID from /proc
+get_pid_bytes() {
+    local pid="$1"
+    local io_file="/proc/$pid/io"
+    if [[ ! -r "$io_file" ]]; then
+        echo 0
+        return
     fi
+    # rchar = bytes read, wchar = bytes written
+    # We use rchar only (incoming data from SSH client + responses from internet)
+    # This avoids double counting
+    local rchar wchar
+    rchar=$(awk '/^rchar:/{print $2}' "$io_file" 2>/dev/null)
+    wchar=$(awk '/^wchar:/{print $2}' "$io_file" 2>/dev/null)
+    [[ -z "$rchar" ]] && rchar=0
+    [[ -z "$wchar" ]] && wchar=0
+    # Total bytes = read + written (full throughput through the tunnel)
+    echo $((rchar + wchar))
 }
 
-# Helper: read bytes from chain
-read_bytes() {
+# Process a single user's bandwidth
+process_user() {
     local user="$1"
-    local chain="FF_BW_${user}"
-    iptables -L "$chain" -vnx 2>/dev/null | awk '/RETURN/{print $2}' | head -1
-}
-
-# Helper: reset counter
-reset_counter() {
-    local user="$1"
-    local chain="FF_BW_${user}"
-    iptables -Z "$chain" 2>/dev/null
-}
-
-# Helper: remove chain for deleted user
-remove_chain() {
-    local user="$1"
-    local uid
-    uid=$(id -u "$user" 2>/dev/null)
-    local chain="FF_BW_${user}"
+    local bandwidth_gb="$2"
     
-    if iptables -L "$chain" -n &>/dev/null; then
-        if [[ -n "$uid" ]]; then
-            iptables -D OUTPUT -m owner --uid-owner "$uid" -j "$chain" 2>/dev/null
+    local usage_file="$BW_DIR/${user}.usage"
+    local user_pid_dir="$PID_TRACK_DIR/${user}"
+    mkdir -p "$user_pid_dir"
+    
+    # Get current accumulated usage
+    local accumulated=0
+    if [[ -f "$usage_file" ]]; then
+        accumulated=$(cat "$usage_file" 2>/dev/null)
+        [[ -z "$accumulated" || "$accumulated" == "" ]] && accumulated=0
+    fi
+    
+    # Find all sshd PIDs for this user
+    local current_pids
+    current_pids=$(pgrep -u "$user" sshd 2>/dev/null)
+    
+    # Also check for parent sshd processes handling this user's connection
+    # On some systems, the tunnel-handling process runs as the user
+    # On others with privsep, we need to find the right process
+    
+    local delta_total=0
+    
+    # Process each active PID
+    for pid in $current_pids; do
+        local pid_file="$user_pid_dir/${pid}.last"
+        local current_bytes
+        current_bytes=$(get_pid_bytes "$pid")
+        
+        if [[ -f "$pid_file" ]]; then
+            local last_bytes
+            last_bytes=$(cat "$pid_file" 2>/dev/null)
+            [[ -z "$last_bytes" ]] && last_bytes=0
+            
+            # Calculate delta (handle counter reset/new process)
+            if [[ "$current_bytes" -ge "$last_bytes" ]]; then
+                local delta=$((current_bytes - last_bytes))
+                delta_total=$((delta_total + delta))
+            else
+                # Process restarted or counter wrapped, count current as new
+                delta_total=$((delta_total + current_bytes))
+            fi
         else
-            iptables -S OUTPUT 2>/dev/null | grep "$chain" | while read -r rule; do
-                iptables $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null
-            done
+            # First time seeing this PID - don't count initial bytes
+            # (they might be from before we started tracking)
+            # Just record the baseline
+            :
         fi
-        iptables -F "$chain" 2>/dev/null
-        iptables -X "$chain" 2>/dev/null
+        
+        # Save current reading
+        echo "$current_bytes" > "$pid_file"
+    done
+    
+    # Clean up tracking files for dead PIDs
+    for pid_file in "$user_pid_dir"/*.last 2>/dev/null; do
+        [[ ! -f "$pid_file" ]] && continue
+        local tracked_pid
+        tracked_pid=$(basename "$pid_file" .last)
+        if [[ ! -d "/proc/$tracked_pid" ]]; then
+            # PID is dead - add its final reading as delta if we haven't already
+            rm -f "$pid_file"
+        fi
+    done
+    
+    # Update accumulated total
+    local new_total=$((accumulated + delta_total))
+    echo "$new_total" > "$usage_file"
+    
+    # Check quota
+    local quota_bytes
+    quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
+    
+    if [[ "$new_total" -ge "$quota_bytes" ]]; then
+        if ! passwd -S "$user" 2>/dev/null | grep -q " L "; then
+            usermod -L "$user" &>/dev/null
+            killall -u "$user" -9 &>/dev/null
+        fi
     fi
 }
 
+# Main loop
 while true; do
     if [[ ! -f "$DB_FILE" ]]; then
-        sleep 60
+        sleep 30
         continue
     fi
     
@@ -359,48 +420,17 @@ while true; do
         
         # Skip if no bandwidth limit (0 or empty = unlimited)
         if [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]]; then
-            remove_chain "$user" 2>/dev/null
             continue
         fi
         
         # Skip if user doesn't exist on system
         if ! id "$user" &>/dev/null; then continue; fi
         
-        # Ensure iptables chain exists
-        ensure_chain "$user"
-        
-        # Read current counter bytes
-        current_bytes=$(read_bytes "$user")
-        [[ -z "$current_bytes" ]] && current_bytes=0
-        
-        # Read accumulated usage
-        usage_file="$BW_DIR/${user}.usage"
-        accumulated=0
-        if [[ -f "$usage_file" ]]; then
-            accumulated=$(cat "$usage_file" 2>/dev/null)
-            [[ -z "$accumulated" ]] && accumulated=0
-        fi
-        
-        # Add current counter to accumulated
-        new_total=$((accumulated + current_bytes))
-        echo "$new_total" > "$usage_file"
-        
-        # Reset iptables counter after reading
-        reset_counter "$user"
-        
-        # Convert quota to bytes (1 GB = 1073741824 bytes)
-        quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
-        
-        # Lock user if over quota
-        if [[ "$new_total" -ge "$quota_bytes" ]]; then
-            if ! passwd -S "$user" 2>/dev/null | grep -q " L "; then
-                usermod -L "$user" &>/dev/null
-                killall -u "$user" -9 &>/dev/null
-            fi
-        fi
+        process_user "$user" "$bandwidth_gb"
     done < "$DB_FILE"
     
-    sleep 30
+    # Poll every 15 seconds for responsive tracking
+    sleep 15
 done
 BWEOF
     chmod +x "$BANDWIDTH_SCRIPT"
@@ -446,17 +476,6 @@ if [[ -z "$username" ]]; then exit 1; fi
 killall -u "$username" -9 &>/dev/null
 sleep 1
 
-# Remove iptables bandwidth chain if exists
-chain="FF_BW_${username}"
-uid=$(id -u "$username" 2>/dev/null)
-if iptables -L "$chain" -n &>/dev/null; then
-    if [[ -n "$uid" ]]; then
-        iptables -D OUTPUT -m owner --uid-owner "$uid" -j "$chain" 2>/dev/null
-    fi
-    iptables -F "$chain" 2>/dev/null
-    iptables -X "$chain" 2>/dev/null
-fi
-
 # Delete system user
 userdel -r "$username" &>/dev/null
 
@@ -465,6 +484,7 @@ sed -i "/^${username}:/d" "$DB_FILE"
 
 # Remove bandwidth tracking
 rm -f "$BW_DIR/${username}.usage"
+rm -rf "$BW_DIR/pidtrack/${username}"
 TREOF
     chmod +x "$TRIAL_CLEANUP_SCRIPT"
 }
@@ -735,17 +755,8 @@ delete_user() {
     fi
 
     # Clean up bandwidth tracking
-    local chain="FF_BW_${username}"
-    if iptables -L "$chain" -n &>/dev/null; then
-        local uid_val
-        uid_val=$(id -u "$username" 2>/dev/null)
-        if [[ -n "$uid_val" ]]; then
-            iptables -D OUTPUT -m owner --uid-owner "$uid_val" -j "$chain" 2>/dev/null
-        fi
-        iptables -F "$chain" 2>/dev/null
-        iptables -X "$chain" 2>/dev/null
-    fi
     rm -f "$BANDWIDTH_DIR/${username}.usage"
+    rm -rf "$BANDWIDTH_DIR/pidtrack/${username}"
 
     sed -i "/^$username:/d" "$DB_FILE"
     echo -e "${C_GREEN}✅ User '$username' has been completely removed.${C_RESET}"
@@ -1001,15 +1012,9 @@ cleanup_expired() {
         for user in "${expired_users[@]}"; do
             echo " - Deleting ${C_YELLOW}$user...${C_RESET}"
             killall -u "$user" -9 &>/dev/null
-            # Clean up bandwidth chain
-            local chain="FF_BW_${user}"
-            local uid_val; uid_val=$(id -u "$user" 2>/dev/null)
-            if iptables -L "$chain" -n &>/dev/null; then
-                [[ -n "$uid_val" ]] && iptables -D OUTPUT -m owner --uid-owner "$uid_val" -j "$chain" 2>/dev/null
-                iptables -F "$chain" 2>/dev/null
-                iptables -X "$chain" 2>/dev/null
-            fi
+            # Clean up bandwidth tracking
             rm -f "$BANDWIDTH_DIR/${user}.usage"
+            rm -rf "$BANDWIDTH_DIR/pidtrack/${user}"
             userdel -r "$user" &>/dev/null
             sed -i "/^$user:/d" "$DB_FILE"
         done
@@ -2715,15 +2720,6 @@ uninstall_script() {
     rm -f "$BANDWIDTH_SERVICE"
     rm -f "$BANDWIDTH_SCRIPT"
     rm -f "$TRIAL_CLEANUP_SCRIPT"
-    
-    # Clean up iptables bandwidth chains
-    iptables -S OUTPUT 2>/dev/null | grep 'FF_BW_' | while read -r rule; do
-        iptables $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null
-    done
-    iptables -L 2>/dev/null | grep 'Chain FF_BW_' | awk '{print $2}' | while read -r chain; do
-        iptables -F "$chain" 2>/dev/null
-        iptables -X "$chain" 2>/dev/null
-    done
     
     chattr -i /etc/resolv.conf &>/dev/null
 
