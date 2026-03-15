@@ -295,17 +295,75 @@ setup_bandwidth_service() {
     mkdir -p "$BANDWIDTH_DIR"
     cat > "$BANDWIDTH_SCRIPT" << 'BWEOF'
 #!/bin/bash
-# FirewallFalcon Bandwidth Monitor v2
-# Uses /proc/<pid>/io to track bytes per SSH user's sshd processes.
-# This correctly captures SSH tunnel/SOCKS proxy traffic (HTTP Custom, HTTP Injector).
+# FirewallFalcon Bandwidth Monitor v3
+# Uses /proc/loginuid + /proc/<pid>/io for reliable per-user SSH tunnel tracking.
+# loginuid is set by PAM on SSH authentication and persists across privsep.
 
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 PID_TRACK_DIR="$BW_DIR/pidtrack"
+DEBUG_LOG="/tmp/ff-bw-debug.log"
 
 mkdir -p "$BW_DIR" "$PID_TRACK_DIR"
 
-# Get total bytes (read + written) for a single PID from /proc
+debug() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$DEBUG_LOG"
+}
+
+# Truncate debug log on startup
+echo "=== FirewallFalcon Bandwidth Monitor v3 started $(date) ===" > "$DEBUG_LOG"
+
+# Find all sshd PIDs belonging to a user (using multiple methods)
+find_user_sshd_pids() {
+    local user="$1"
+    local user_uid
+    user_uid=$(id -u "$user" 2>/dev/null) || return
+    
+    local all_pids=""
+    
+    # Method 1: Direct pgrep -u (finds processes with effective UID = user)
+    local m1_pids
+    m1_pids=$(pgrep -u "$user" sshd 2>/dev/null)
+    if [[ -n "$m1_pids" ]]; then
+        all_pids="$m1_pids"
+        debug "  M1(pgrep-u): found PIDs: $m1_pids"
+    fi
+    
+    # Method 2: Scan /proc/*/loginuid for sshd processes
+    # loginuid is set by PAM on authentication and correctly identifies the
+    # connecting user even for privsep processes running as 'sshd' or root
+    for proc_dir in /proc/[0-9]*/; do
+        [[ ! -d "$proc_dir" ]] && continue
+        local pid
+        pid=$(basename "$proc_dir")
+        
+        # Only look at sshd processes
+        local comm
+        comm=$(cat "$proc_dir/comm" 2>/dev/null)
+        [[ "$comm" != "sshd" ]] && continue
+        
+        # Check loginuid
+        local loginuid
+        loginuid=$(cat "$proc_dir/loginuid" 2>/dev/null)
+        [[ -z "$loginuid" || "$loginuid" == "4294967295" ]] && continue
+        
+        if [[ "$loginuid" == "$user_uid" ]]; then
+            # Found an sshd process authenticated as this user
+            # Skip the main daemon (ppid=1) but include privsep and child processes
+            local ppid
+            ppid=$(awk '/^PPid:/{print $2}' "$proc_dir/status" 2>/dev/null)
+            if [[ "$ppid" != "1" ]]; then
+                all_pids="$all_pids $pid"
+                debug "  M2(loginuid): found PID $pid (comm=$comm, loginuid=$loginuid, ppid=$ppid)"
+            fi
+        fi
+    done
+    
+    # Deduplicate
+    echo "$all_pids" | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ' '
+}
+
+# Get total bytes for a PID from /proc/<pid>/io
 get_pid_bytes() {
     local pid="$1"
     local io_file="/proc/$pid/io"
@@ -313,19 +371,15 @@ get_pid_bytes() {
         echo 0
         return
     fi
-    # rchar = bytes read, wchar = bytes written
-    # We use rchar only (incoming data from SSH client + responses from internet)
-    # This avoids double counting
     local rchar wchar
     rchar=$(awk '/^rchar:/{print $2}' "$io_file" 2>/dev/null)
     wchar=$(awk '/^wchar:/{print $2}' "$io_file" 2>/dev/null)
     [[ -z "$rchar" ]] && rchar=0
     [[ -z "$wchar" ]] && wchar=0
-    # Total bytes = read + written (full throughput through the tunnel)
     echo $((rchar + wchar))
 }
 
-# Process a single user's bandwidth
+# Process bandwidth for a single user
 process_user() {
     local user="$1"
     local bandwidth_gb="$2"
@@ -334,67 +388,74 @@ process_user() {
     local user_pid_dir="$PID_TRACK_DIR/${user}"
     mkdir -p "$user_pid_dir"
     
-    # Get current accumulated usage
+    # Get accumulated usage
     local accumulated=0
     if [[ -f "$usage_file" ]]; then
         accumulated=$(cat "$usage_file" 2>/dev/null)
-        [[ -z "$accumulated" || "$accumulated" == "" ]] && accumulated=0
+        [[ -z "$accumulated" || ! "$accumulated" =~ ^[0-9]+$ ]] && accumulated=0
     fi
     
-    # Find all sshd PIDs for this user
-    local current_pids
-    current_pids=$(pgrep -u "$user" sshd 2>/dev/null)
+    # Find PIDs
+    debug "Processing user: $user (quota: ${bandwidth_gb}GB, accumulated: $accumulated)"
+    local pids
+    pids=$(find_user_sshd_pids "$user")
     
-    # Also check for parent sshd processes handling this user's connection
-    # On some systems, the tunnel-handling process runs as the user
-    # On others with privsep, we need to find the right process
+    if [[ -z "$pids" || "$pids" =~ ^[[:space:]]*$ ]]; then
+        debug "  No sshd PIDs found for user $user"
+        # Still clean up dead PID tracking files
+        rm -f "$user_pid_dir"/*.last 2>/dev/null
+        return
+    fi
     
     local delta_total=0
     
-    # Process each active PID
-    for pid in $current_pids; do
+    for pid in $pids; do
+        [[ -z "$pid" ]] && continue
         local pid_file="$user_pid_dir/${pid}.last"
         local current_bytes
         current_bytes=$(get_pid_bytes "$pid")
+        
+        debug "  PID $pid: current_bytes=$current_bytes"
         
         if [[ -f "$pid_file" ]]; then
             local last_bytes
             last_bytes=$(cat "$pid_file" 2>/dev/null)
             [[ -z "$last_bytes" ]] && last_bytes=0
             
-            # Calculate delta (handle counter reset/new process)
             if [[ "$current_bytes" -ge "$last_bytes" ]]; then
                 local delta=$((current_bytes - last_bytes))
                 delta_total=$((delta_total + delta))
+                debug "  PID $pid: delta=$delta (was $last_bytes)"
             else
-                # Process restarted or counter wrapped, count current as new
                 delta_total=$((delta_total + current_bytes))
+                debug "  PID $pid: counter reset, delta=$current_bytes"
             fi
         else
-            # First time seeing this PID - don't count initial bytes
-            # (they might be from before we started tracking)
-            # Just record the baseline
-            :
+            # First time seeing this PID, record baseline
+            debug "  PID $pid: first seen, baseline=$current_bytes"
         fi
         
-        # Save current reading
         echo "$current_bytes" > "$pid_file"
     done
     
-    # Clean up tracking files for dead PIDs
+    # Clean up tracking for dead PIDs
     for pid_file in "$user_pid_dir"/*.last 2>/dev/null; do
         [[ ! -f "$pid_file" ]] && continue
         local tracked_pid
         tracked_pid=$(basename "$pid_file" .last)
         if [[ ! -d "/proc/$tracked_pid" ]]; then
-            # PID is dead - add its final reading as delta if we haven't already
             rm -f "$pid_file"
+            debug "  Cleaned dead PID tracker: $tracked_pid"
         fi
     done
     
-    # Update accumulated total
+    # Update total
     local new_total=$((accumulated + delta_total))
     echo "$new_total" > "$usage_file"
+    
+    if [[ "$delta_total" -gt 0 ]]; then
+        debug "  User $user: delta_total=$delta_total, new_total=$new_total"
+    fi
     
     # Check quota
     local quota_bytes
@@ -404,6 +465,7 @@ process_user() {
         if ! passwd -S "$user" 2>/dev/null | grep -q " L "; then
             usermod -L "$user" &>/dev/null
             killall -u "$user" -9 &>/dev/null
+            debug "  *** USER $user LOCKED - exceeded quota ($new_total >= $quota_bytes)"
         fi
     fi
 }
@@ -418,18 +480,15 @@ while true; do
     while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
         [[ -z "$user" || "$user" == \#* ]] && continue
         
-        # Skip if no bandwidth limit (0 or empty = unlimited)
         if [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]]; then
             continue
         fi
         
-        # Skip if user doesn't exist on system
         if ! id "$user" &>/dev/null; then continue; fi
         
         process_user "$user" "$bandwidth_gb"
     done < "$DB_FILE"
     
-    # Poll every 15 seconds for responsive tracking
     sleep 15
 done
 BWEOF
