@@ -204,12 +204,15 @@ check_and_free_ports() {
 }
 
 setup_limiter_service() {
-    # Updated logic: No logging, smart 120s lockout
+    # Combined limiter + bandwidth monitoring
     cat > "$LIMITER_SCRIPT" << 'EOF'
 #!/bin/bash
 DB_FILE="/etc/firewallfalcon/users.db"
+BW_DIR="/etc/firewallfalcon/bandwidth"
+PID_DIR="$BW_DIR/pidtrack"
 
-# Loop continuously with optimized sleep
+mkdir -p "$BW_DIR" "$PID_DIR"
+
 while true; do
     if [[ ! -f "$DB_FILE" ]]; then
         sleep 30
@@ -218,15 +221,10 @@ while true; do
     
     current_ts=$(date +%s)
     
-    # Cache active users to minimize pgrep calls inside loop
-    # Get count of sshd processes per user in one go is hard in bash without map,
-    # so we optimize the per-user check.
-    
     while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
         [[ -z "$user" || "$user" == \#* ]] && continue
         
         # --- Expiry Check ---
-        # Only check expiry if we have a valid expiry date
         if [[ "$expiry" != "Never" && "$expiry" != "" ]]; then
              expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
              if [[ $expiry_ts -lt $current_ts && $expiry_ts -ne 0 ]]; then
@@ -239,7 +237,6 @@ while true; do
         fi
         
         # --- Connection Limit Check ---
-        # Optimization: pgrep -c is faster than pipe to wc
         online_count=$(pgrep -c -u "$user" sshd)
         if ! [[ "$limit" =~ ^[0-9]+$ ]]; then limit=1; fi
         
@@ -252,10 +249,112 @@ while true; do
                 killall -u "$user" -9 &>/dev/null
             fi
         fi
+        
+        # --- Bandwidth Check ---
+        [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
+        
+        # Get user UID
+        user_uid=$(id -u "$user" 2>/dev/null)
+        [[ -z "$user_uid" ]] && continue
+        
+        # Find sshd PIDs for this user via loginuid
+        pids=""
+        
+        # Method 1: pgrep
+        m1=$(pgrep -u "$user" sshd 2>/dev/null | tr '\n' ' ')
+        pids="$m1"
+        
+        # Method 2: loginuid scan
+        for p in /proc/[0-9]*/loginuid; do
+            [[ ! -f "$p" ]] && continue
+            luid=$(cat "$p" 2>/dev/null)
+            [[ -z "$luid" || "$luid" == "4294967295" ]] && continue
+            [[ "$luid" != "$user_uid" ]] && continue
+            
+            pid_dir=$(dirname "$p")
+            pid_num=$(basename "$pid_dir")
+            
+            cname=$(cat "$pid_dir/comm" 2>/dev/null)
+            [[ "$cname" != "sshd" ]] && continue
+            
+            ppid_val=$(awk '/^PPid:/{print $2}' "$pid_dir/status" 2>/dev/null)
+            [[ "$ppid_val" == "1" ]] && continue
+            
+            pids="$pids $pid_num"
+        done
+        
+        # Deduplicate
+        pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
+        
+        # Read accumulated usage
+        usagefile="$BW_DIR/${user}.usage"
+        accumulated=0
+        if [[ -f "$usagefile" ]]; then
+            accumulated=$(cat "$usagefile" 2>/dev/null)
+            if ! [[ "$accumulated" =~ ^[0-9]+$ ]]; then accumulated=0; fi
+        fi
+        
+        if [[ -z "$pids" ]]; then
+            rm -f "$PID_DIR/${user}__"*.last 2>/dev/null
+            continue
+        fi
+        
+        delta_total=0
+        
+        for pid in $pids; do
+            [[ -z "$pid" ]] && continue
+            io_file="/proc/$pid/io"
+            if [[ -r "$io_file" ]]; then
+                rchar=$(awk '/^rchar:/{print $2}' "$io_file" 2>/dev/null)
+                wchar=$(awk '/^wchar:/{print $2}' "$io_file" 2>/dev/null)
+                [[ -z "$rchar" ]] && rchar=0
+                [[ -z "$wchar" ]] && wchar=0
+                cur=$((rchar + wchar))
+            else
+                cur=0
+            fi
+            
+            pidfile="$PID_DIR/${user}__${pid}.last"
+            
+            if [[ -f "$pidfile" ]]; then
+                prev=$(cat "$pidfile" 2>/dev/null)
+                if ! [[ "$prev" =~ ^[0-9]+$ ]]; then prev=0; fi
+                
+                if [[ "$cur" -ge "$prev" ]]; then
+                    d=$((cur - prev))
+                else
+                    d=$cur
+                fi
+                delta_total=$((delta_total + d))
+            fi
+            echo "$cur" > "$pidfile"
+        done
+        
+        # Clean up dead PID files
+        for f in "$PID_DIR/${user}__"*.last; do
+            [[ ! -f "$f" ]] && continue
+            fpid=$(basename "$f" .last)
+            fpid=${fpid#${user}__}
+            [[ ! -d "/proc/$fpid" ]] && rm -f "$f"
+        done
+        
+        # Update total
+        new_total=$((accumulated + delta_total))
+        echo "$new_total" > "$usagefile"
+        
+        # Check quota
+        quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
+        
+        if [[ "$new_total" -ge "$quota_bytes" ]]; then
+            if ! passwd -S "$user" 2>/dev/null | grep -q " L "; then
+                usermod -L "$user" &>/dev/null
+                killall -u "$user" -9 &>/dev/null
+            fi
+        fi
+        
     done < "$DB_FILE"
     
-    # Sleep increased to 25 seconds to reduce CPU load
-    sleep 25
+    sleep 15
 done
 EOF
     chmod +x "$LIMITER_SCRIPT"
@@ -275,7 +374,6 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    # Force kill any old limiter process to prevent systemctl restart hanging
     pkill -f "firewallfalcon-limiter" 2>/dev/null
 
     if ! systemctl is-active --quiet firewallfalcon-limiter; then
@@ -284,198 +382,20 @@ EOF
         systemctl start firewallfalcon-limiter --no-block &>/dev/null
         
     else
-        # Restart if already running to apply new logic
         systemctl restart firewallfalcon-limiter --no-block &>/dev/null
         
     fi
 }
 
-
 setup_bandwidth_service() {
     mkdir -p "$BANDWIDTH_DIR"
-    cat > "$BANDWIDTH_SCRIPT" << 'BWEOF'
-#!/bin/bash
-# FirewallFalcon Bandwidth Monitor v4
-
-DB_FILE="/etc/firewallfalcon/users.db"
-BW_DIR="/etc/firewallfalcon/bandwidth"
-PID_DIR="$BW_DIR/pidtrack"
-LOG="/tmp/ff-bw-debug.log"
-
-mkdir -p "$BW_DIR" "$PID_DIR"
-
-# APPEND log (don't overwrite on restart)
-echo "" >> "$LOG"
-echo "=== BW Monitor v4 started $(date) ===" >> "$LOG"
-
-# Trap errors
-trap 'echo "[$(date +%H:%M:%S)] CRASHED at line $LINENO: $BASH_COMMAND" >> "$LOG"' ERR
-
-get_bytes() {
-    # Read rchar+wchar from /proc/$1/io
-    local f="/proc/$1/io"
-    if [ ! -r "$f" ]; then echo 0; return; fi
-    local r w
-    r=$(grep '^rchar:' "$f" 2>/dev/null | awk '{print $2}')
-    w=$(grep '^wchar:' "$f" 2>/dev/null | awk '{print $2}')
-    [ -z "$r" ] && r=0
-    [ -z "$w" ] && w=0
-    echo $((r + w))
-}
-
-while true; do
-    if [ ! -f "$DB_FILE" ]; then
-        sleep 30
-        continue
+    # Bandwidth monitoring is now integrated into the limiter service above.
+    # Stop the old standalone bandwidth service if it exists.
+    if systemctl is-active --quiet firewallfalcon-bandwidth 2>/dev/null; then
+        systemctl stop firewallfalcon-bandwidth &>/dev/null
+        systemctl disable firewallfalcon-bandwidth &>/dev/null
     fi
-
-    while IFS=: read -r user pass expiry limit bwlimit rest; do
-        # Skip empty/comments
-        [ -z "$user" ] && continue
-        case "$user" in \#*) continue ;; esac
-
-        # Skip if no bandwidth limit
-        [ -z "$bwlimit" ] && continue
-        [ "$bwlimit" = "0" ] && continue
-
-        # Skip if user doesn't exist
-        id "$user" >/dev/null 2>&1 || continue
-
-        user_uid=$(id -u "$user" 2>/dev/null)
-        [ -z "$user_uid" ] && continue
-
-        # --- Find sshd PIDs for this user ---
-        pids=""
-
-        # Method 1: pgrep direct match
-        m1=$(pgrep -u "$user" sshd 2>/dev/null | tr '\n' ' ')
-        pids="$m1"
-
-        # Method 2: loginuid scan (catches privsep processes)
-        for p in /proc/[0-9]*/loginuid; do
-            [ ! -f "$p" ] && continue
-            luid=$(cat "$p" 2>/dev/null)
-            [ -z "$luid" ] && continue
-            [ "$luid" = "4294967295" ] && continue
-            [ "$luid" != "$user_uid" ] && continue
-
-            pid_dir=$(dirname "$p")
-            pid_num=$(basename "$pid_dir")
-
-            # Must be sshd
-            cname=$(cat "$pid_dir/comm" 2>/dev/null)
-            [ "$cname" != "sshd" ] && continue
-
-            # Skip main daemon (ppid=1)
-            ppid=$(grep '^PPid:' "$pid_dir/status" 2>/dev/null | awk '{print $2}')
-            [ "$ppid" = "1" ] && continue
-
-            pids="$pids $pid_num"
-        done
-
-        # Deduplicate PIDs
-        pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
-
-        # Read accumulated usage
-        usagefile="$BW_DIR/${user}.usage"
-        accumulated=0
-        if [ -f "$usagefile" ]; then
-            accumulated=$(cat "$usagefile" 2>/dev/null)
-            case "$accumulated" in
-                ''|*[!0-9]*) accumulated=0 ;;
-            esac
-        fi
-
-        echo "[$(date +%H:%M:%S)] user=$user uid=$user_uid bw=${bwlimit}GB acc=$accumulated pids=[$pids]" >> "$LOG"
-
-        if [ -z "$pids" ]; then
-            # No active sessions, clean up stale pid files
-            rm -f "$PID_DIR/${user}__"*.last 2>/dev/null
-            continue
-        fi
-
-        delta_total=0
-
-        for pid in $pids; do
-            [ -z "$pid" ] && continue
-            cur=$(get_bytes "$pid")
-            pidfile="$PID_DIR/${user}__${pid}.last"
-
-            if [ -f "$pidfile" ]; then
-                prev=$(cat "$pidfile" 2>/dev/null)
-                case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
-
-                if [ "$cur" -ge "$prev" ] 2>/dev/null; then
-                    d=$((cur - prev))
-                else
-                    d=$cur
-                fi
-                delta_total=$((delta_total + d))
-            fi
-            # Save current (also serves as baseline for first-seen PIDs)
-            echo "$cur" > "$pidfile"
-        done
-
-        # Clean up dead PID files
-        for f in "$PID_DIR/${user}__"*.last 2>/dev/null; do
-            [ ! -f "$f" ] && continue
-            fpid=$(basename "$f" .last | sed "s/^${user}__//")
-            if [ ! -d "/proc/$fpid" ]; then
-                rm -f "$f"
-            fi
-        done
-
-        # Update total
-        new_total=$((accumulated + delta_total))
-        echo "$new_total" > "$usagefile"
-
-        if [ "$delta_total" -gt 0 ] 2>/dev/null; then
-            echo "[$(date +%H:%M:%S)]   delta=$delta_total new_total=$new_total" >> "$LOG"
-        fi
-
-        # Check quota (convert GB to bytes)
-        quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bwlimit * 1073741824}")
-
-        if [ "$new_total" -ge "$quota_bytes" ] 2>/dev/null; then
-            locked=$(passwd -S "$user" 2>/dev/null | grep -c " L ")
-            if [ "$locked" = "0" ]; then
-                usermod -L "$user" 2>/dev/null
-                killall -u "$user" -9 2>/dev/null
-                echo "[$(date +%H:%M:%S)]   *** LOCKED $user ($new_total >= $quota_bytes)" >> "$LOG"
-            fi
-        fi
-
-    done < "$DB_FILE"
-
-    sleep 15
-done
-BWEOF
-    chmod +x "$BANDWIDTH_SCRIPT"
-
-    cat > "$BANDWIDTH_SERVICE" << EOF
-[Unit]
-Description=FirewallFalcon Bandwidth Monitor
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$BANDWIDTH_SCRIPT
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    pkill -f "firewallfalcon-bandwidth" 2>/dev/null
-
-    if ! systemctl is-active --quiet firewallfalcon-bandwidth; then
-        systemctl daemon-reload
-        systemctl enable firewallfalcon-bandwidth &>/dev/null
-        systemctl start firewallfalcon-bandwidth --no-block &>/dev/null
-    else
-        systemctl restart firewallfalcon-bandwidth --no-block &>/dev/null
-    fi
+    rm -f "$BANDWIDTH_SERVICE" "$BANDWIDTH_SCRIPT" 2>/dev/null
 }
 
 setup_trial_cleanup_script() {
