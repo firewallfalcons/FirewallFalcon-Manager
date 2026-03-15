@@ -295,200 +295,158 @@ setup_bandwidth_service() {
     mkdir -p "$BANDWIDTH_DIR"
     cat > "$BANDWIDTH_SCRIPT" << 'BWEOF'
 #!/bin/bash
-# FirewallFalcon Bandwidth Monitor v3
-# Uses /proc/loginuid + /proc/<pid>/io for reliable per-user SSH tunnel tracking.
-# loginuid is set by PAM on SSH authentication and persists across privsep.
+# FirewallFalcon Bandwidth Monitor v4
 
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
-PID_TRACK_DIR="$BW_DIR/pidtrack"
-DEBUG_LOG="/tmp/ff-bw-debug.log"
+PID_DIR="$BW_DIR/pidtrack"
+LOG="/tmp/ff-bw-debug.log"
 
-mkdir -p "$BW_DIR" "$PID_TRACK_DIR"
+mkdir -p "$BW_DIR" "$PID_DIR"
 
-debug() {
-    echo "[$(date '+%H:%M:%S')] $*" >> "$DEBUG_LOG"
+# APPEND log (don't overwrite on restart)
+echo "" >> "$LOG"
+echo "=== BW Monitor v4 started $(date) ===" >> "$LOG"
+
+# Trap errors
+trap 'echo "[$(date +%H:%M:%S)] CRASHED at line $LINENO: $BASH_COMMAND" >> "$LOG"' ERR
+
+get_bytes() {
+    # Read rchar+wchar from /proc/$1/io
+    local f="/proc/$1/io"
+    if [ ! -r "$f" ]; then echo 0; return; fi
+    local r w
+    r=$(grep '^rchar:' "$f" 2>/dev/null | awk '{print $2}')
+    w=$(grep '^wchar:' "$f" 2>/dev/null | awk '{print $2}')
+    [ -z "$r" ] && r=0
+    [ -z "$w" ] && w=0
+    echo $((r + w))
 }
 
-# Truncate debug log on startup
-echo "=== FirewallFalcon Bandwidth Monitor v3 started $(date) ===" > "$DEBUG_LOG"
-
-# Find all sshd PIDs belonging to a user (using multiple methods)
-find_user_sshd_pids() {
-    local user="$1"
-    local user_uid
-    user_uid=$(id -u "$user" 2>/dev/null) || return
-    
-    local all_pids=""
-    
-    # Method 1: Direct pgrep -u (finds processes with effective UID = user)
-    local m1_pids
-    m1_pids=$(pgrep -u "$user" sshd 2>/dev/null)
-    if [[ -n "$m1_pids" ]]; then
-        all_pids="$m1_pids"
-        debug "  M1(pgrep-u): found PIDs: $m1_pids"
-    fi
-    
-    # Method 2: Scan /proc/*/loginuid for sshd processes
-    # loginuid is set by PAM on authentication and correctly identifies the
-    # connecting user even for privsep processes running as 'sshd' or root
-    for proc_dir in /proc/[0-9]*/; do
-        [[ ! -d "$proc_dir" ]] && continue
-        local pid
-        pid=$(basename "$proc_dir")
-        
-        # Only look at sshd processes
-        local comm
-        comm=$(cat "$proc_dir/comm" 2>/dev/null)
-        [[ "$comm" != "sshd" ]] && continue
-        
-        # Check loginuid
-        local loginuid
-        loginuid=$(cat "$proc_dir/loginuid" 2>/dev/null)
-        [[ -z "$loginuid" || "$loginuid" == "4294967295" ]] && continue
-        
-        if [[ "$loginuid" == "$user_uid" ]]; then
-            # Found an sshd process authenticated as this user
-            # Skip the main daemon (ppid=1) but include privsep and child processes
-            local ppid
-            ppid=$(awk '/^PPid:/{print $2}' "$proc_dir/status" 2>/dev/null)
-            if [[ "$ppid" != "1" ]]; then
-                all_pids="$all_pids $pid"
-                debug "  M2(loginuid): found PID $pid (comm=$comm, loginuid=$loginuid, ppid=$ppid)"
-            fi
-        fi
-    done
-    
-    # Deduplicate
-    echo "$all_pids" | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ' '
-}
-
-# Get total bytes for a PID from /proc/<pid>/io
-get_pid_bytes() {
-    local pid="$1"
-    local io_file="/proc/$pid/io"
-    if [[ ! -r "$io_file" ]]; then
-        echo 0
-        return
-    fi
-    local rchar wchar
-    rchar=$(awk '/^rchar:/{print $2}' "$io_file" 2>/dev/null)
-    wchar=$(awk '/^wchar:/{print $2}' "$io_file" 2>/dev/null)
-    [[ -z "$rchar" ]] && rchar=0
-    [[ -z "$wchar" ]] && wchar=0
-    echo $((rchar + wchar))
-}
-
-# Process bandwidth for a single user
-process_user() {
-    local user="$1"
-    local bandwidth_gb="$2"
-    
-    local usage_file="$BW_DIR/${user}.usage"
-    local user_pid_dir="$PID_TRACK_DIR/${user}"
-    mkdir -p "$user_pid_dir"
-    
-    # Get accumulated usage
-    local accumulated=0
-    if [[ -f "$usage_file" ]]; then
-        accumulated=$(cat "$usage_file" 2>/dev/null)
-        [[ -z "$accumulated" || ! "$accumulated" =~ ^[0-9]+$ ]] && accumulated=0
-    fi
-    
-    # Find PIDs
-    debug "Processing user: $user (quota: ${bandwidth_gb}GB, accumulated: $accumulated)"
-    local pids
-    pids=$(find_user_sshd_pids "$user")
-    
-    if [[ -z "$pids" || "$pids" =~ ^[[:space:]]*$ ]]; then
-        debug "  No sshd PIDs found for user $user"
-        # Still clean up dead PID tracking files
-        rm -f "$user_pid_dir"/*.last 2>/dev/null
-        return
-    fi
-    
-    local delta_total=0
-    
-    for pid in $pids; do
-        [[ -z "$pid" ]] && continue
-        local pid_file="$user_pid_dir/${pid}.last"
-        local current_bytes
-        current_bytes=$(get_pid_bytes "$pid")
-        
-        debug "  PID $pid: current_bytes=$current_bytes"
-        
-        if [[ -f "$pid_file" ]]; then
-            local last_bytes
-            last_bytes=$(cat "$pid_file" 2>/dev/null)
-            [[ -z "$last_bytes" ]] && last_bytes=0
-            
-            if [[ "$current_bytes" -ge "$last_bytes" ]]; then
-                local delta=$((current_bytes - last_bytes))
-                delta_total=$((delta_total + delta))
-                debug "  PID $pid: delta=$delta (was $last_bytes)"
-            else
-                delta_total=$((delta_total + current_bytes))
-                debug "  PID $pid: counter reset, delta=$current_bytes"
-            fi
-        else
-            # First time seeing this PID, record baseline
-            debug "  PID $pid: first seen, baseline=$current_bytes"
-        fi
-        
-        echo "$current_bytes" > "$pid_file"
-    done
-    
-    # Clean up tracking for dead PIDs
-    for pid_file in "$user_pid_dir"/*.last 2>/dev/null; do
-        [[ ! -f "$pid_file" ]] && continue
-        local tracked_pid
-        tracked_pid=$(basename "$pid_file" .last)
-        if [[ ! -d "/proc/$tracked_pid" ]]; then
-            rm -f "$pid_file"
-            debug "  Cleaned dead PID tracker: $tracked_pid"
-        fi
-    done
-    
-    # Update total
-    local new_total=$((accumulated + delta_total))
-    echo "$new_total" > "$usage_file"
-    
-    if [[ "$delta_total" -gt 0 ]]; then
-        debug "  User $user: delta_total=$delta_total, new_total=$new_total"
-    fi
-    
-    # Check quota
-    local quota_bytes
-    quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
-    
-    if [[ "$new_total" -ge "$quota_bytes" ]]; then
-        if ! passwd -S "$user" 2>/dev/null | grep -q " L "; then
-            usermod -L "$user" &>/dev/null
-            killall -u "$user" -9 &>/dev/null
-            debug "  *** USER $user LOCKED - exceeded quota ($new_total >= $quota_bytes)"
-        fi
-    fi
-}
-
-# Main loop
 while true; do
-    if [[ ! -f "$DB_FILE" ]]; then
+    if [ ! -f "$DB_FILE" ]; then
         sleep 30
         continue
     fi
-    
-    while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
-        [[ -z "$user" || "$user" == \#* ]] && continue
-        
-        if [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]]; then
+
+    while IFS=: read -r user pass expiry limit bwlimit rest; do
+        # Skip empty/comments
+        [ -z "$user" ] && continue
+        case "$user" in \#*) continue ;; esac
+
+        # Skip if no bandwidth limit
+        [ -z "$bwlimit" ] && continue
+        [ "$bwlimit" = "0" ] && continue
+
+        # Skip if user doesn't exist
+        id "$user" >/dev/null 2>&1 || continue
+
+        user_uid=$(id -u "$user" 2>/dev/null)
+        [ -z "$user_uid" ] && continue
+
+        # --- Find sshd PIDs for this user ---
+        pids=""
+
+        # Method 1: pgrep direct match
+        m1=$(pgrep -u "$user" sshd 2>/dev/null | tr '\n' ' ')
+        pids="$m1"
+
+        # Method 2: loginuid scan (catches privsep processes)
+        for p in /proc/[0-9]*/loginuid; do
+            [ ! -f "$p" ] && continue
+            luid=$(cat "$p" 2>/dev/null)
+            [ -z "$luid" ] && continue
+            [ "$luid" = "4294967295" ] && continue
+            [ "$luid" != "$user_uid" ] && continue
+
+            pid_dir=$(dirname "$p")
+            pid_num=$(basename "$pid_dir")
+
+            # Must be sshd
+            cname=$(cat "$pid_dir/comm" 2>/dev/null)
+            [ "$cname" != "sshd" ] && continue
+
+            # Skip main daemon (ppid=1)
+            ppid=$(grep '^PPid:' "$pid_dir/status" 2>/dev/null | awk '{print $2}')
+            [ "$ppid" = "1" ] && continue
+
+            pids="$pids $pid_num"
+        done
+
+        # Deduplicate PIDs
+        pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
+
+        # Read accumulated usage
+        usagefile="$BW_DIR/${user}.usage"
+        accumulated=0
+        if [ -f "$usagefile" ]; then
+            accumulated=$(cat "$usagefile" 2>/dev/null)
+            case "$accumulated" in
+                ''|*[!0-9]*) accumulated=0 ;;
+            esac
+        fi
+
+        echo "[$(date +%H:%M:%S)] user=$user uid=$user_uid bw=${bwlimit}GB acc=$accumulated pids=[$pids]" >> "$LOG"
+
+        if [ -z "$pids" ]; then
+            # No active sessions, clean up stale pid files
+            rm -f "$PID_DIR/${user}__"*.last 2>/dev/null
             continue
         fi
-        
-        if ! id "$user" &>/dev/null; then continue; fi
-        
-        process_user "$user" "$bandwidth_gb"
+
+        delta_total=0
+
+        for pid in $pids; do
+            [ -z "$pid" ] && continue
+            cur=$(get_bytes "$pid")
+            pidfile="$PID_DIR/${user}__${pid}.last"
+
+            if [ -f "$pidfile" ]; then
+                prev=$(cat "$pidfile" 2>/dev/null)
+                case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+
+                if [ "$cur" -ge "$prev" ] 2>/dev/null; then
+                    d=$((cur - prev))
+                else
+                    d=$cur
+                fi
+                delta_total=$((delta_total + d))
+            fi
+            # Save current (also serves as baseline for first-seen PIDs)
+            echo "$cur" > "$pidfile"
+        done
+
+        # Clean up dead PID files
+        for f in "$PID_DIR/${user}__"*.last 2>/dev/null; do
+            [ ! -f "$f" ] && continue
+            fpid=$(basename "$f" .last | sed "s/^${user}__//")
+            if [ ! -d "/proc/$fpid" ]; then
+                rm -f "$f"
+            fi
+        done
+
+        # Update total
+        new_total=$((accumulated + delta_total))
+        echo "$new_total" > "$usagefile"
+
+        if [ "$delta_total" -gt 0 ] 2>/dev/null; then
+            echo "[$(date +%H:%M:%S)]   delta=$delta_total new_total=$new_total" >> "$LOG"
+        fi
+
+        # Check quota (convert GB to bytes)
+        quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bwlimit * 1073741824}")
+
+        if [ "$new_total" -ge "$quota_bytes" ] 2>/dev/null; then
+            locked=$(passwd -S "$user" 2>/dev/null | grep -c " L ")
+            if [ "$locked" = "0" ]; then
+                usermod -L "$user" 2>/dev/null
+                killall -u "$user" -9 2>/dev/null
+                echo "[$(date +%H:%M:%S)]   *** LOCKED $user ($new_total >= $quota_bytes)" >> "$LOG"
+            fi
+        fi
+
     done < "$DB_FILE"
-    
+
     sleep 15
 done
 BWEOF
