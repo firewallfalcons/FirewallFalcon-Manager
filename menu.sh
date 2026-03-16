@@ -53,6 +53,8 @@ BANDWIDTH_DIR="$DB_DIR/bandwidth"
 BANDWIDTH_SCRIPT="/usr/local/bin/firewallfalcon-bandwidth.sh"
 BANDWIDTH_SERVICE="/etc/systemd/system/firewallfalcon-bandwidth.service"
 TRIAL_CLEANUP_SCRIPT="/usr/local/bin/firewallfalcon-trial-cleanup.sh"
+LOGIN_INFO_SCRIPT="/usr/local/bin/firewallfalcon-login-info.sh"
+SSHD_FF_CONFIG="/etc/ssh/sshd_config.d/firewallfalcon.conf"
 
 # --- ZiVPN Variables ---
 ZIVPN_DIR="/etc/zivpn"
@@ -104,6 +106,9 @@ initial_setup() {
     
     echo -e "${C_BLUE}🔹 Installing trial account cleanup script...${C_RESET}"
     setup_trial_cleanup_script
+    
+    echo -e "${C_BLUE}🔹 Configuring SSH login info banner...${C_RESET}"
+    setup_ssh_login_info
     
     if [ ! -f "$INSTALL_FLAG_FILE" ]; then
         touch "$INSTALL_FLAG_FILE"
@@ -426,6 +431,119 @@ TREOF
     chmod +x "$TRIAL_CLEANUP_SCRIPT"
 }
 
+setup_ssh_login_info() {
+    # Create the ffusers group if it doesn't exist
+    getent group ffusers &>/dev/null || groupadd ffusers 2>/dev/null
+    
+    # Add all existing DB users to the group
+    if [[ -f "$DB_FILE" ]]; then
+        while IFS=: read -r u _rest; do
+            [[ -z "$u" || "$u" == \#* ]] && continue
+            id "$u" &>/dev/null && usermod -aG ffusers "$u" 2>/dev/null
+        done < "$DB_FILE"
+    fi
+    
+    # Create the login info wrapper script
+    cat > "$LOGIN_INFO_SCRIPT" << 'LOGINEOF'
+#!/bin/bash
+# FirewallFalcon SSH Login Info Banner
+# Shows account details when user connects via SSH tunnel
+
+DB_FILE="/etc/firewallfalcon/users.db"
+BW_DIR="/etc/firewallfalcon/bandwidth"
+user=$(whoami)
+
+# Read user info from DB
+line=$(grep "^${user}:" "$DB_FILE" 2>/dev/null)
+if [[ -z "$line" ]]; then
+    # Not a managed user, just sleep to keep tunnel alive
+    sleep infinity &
+    wait
+    exit 0
+fi
+
+expiry=$(echo "$line" | cut -d: -f3)
+limit=$(echo "$line" | cut -d: -f4)
+bandwidth_gb=$(echo "$line" | cut -d: -f5)
+[[ -z "$bandwidth_gb" ]] && bandwidth_gb="0"
+
+# Calculate days remaining
+days_left="N/A"
+if [[ "$expiry" != "Never" && -n "$expiry" ]]; then
+    expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+    current_ts=$(date +%s)
+    if [[ $expiry_ts -gt 0 ]]; then
+        diff_secs=$((expiry_ts - current_ts))
+        if [[ $diff_secs -le 0 ]]; then
+            days_left="EXPIRED"
+        else
+            days_left=$(( diff_secs / 86400 ))
+            hours_left=$(( (diff_secs % 86400) / 3600 ))
+            if [[ $days_left -eq 0 ]]; then
+                days_left="${hours_left}h left"
+            else
+                days_left="${days_left}d ${hours_left}h"
+            fi
+        fi
+    fi
+fi
+
+# Calculate bandwidth info
+bw_info="Unlimited"
+if [[ "$bandwidth_gb" != "0" ]]; then
+    usage_file="$BW_DIR/${user}.usage"
+    used_bytes=0
+    if [[ -f "$usage_file" ]]; then
+        used_bytes=$(cat "$usage_file" 2>/dev/null)
+        [[ -z "$used_bytes" ]] && used_bytes=0
+    fi
+    used_gb=$(awk "BEGIN {printf \"%.2f\", $used_bytes / 1073741824}")
+    remain_gb=$(awk "BEGIN {r=$bandwidth_gb - $used_gb; if(r<0) r=0; printf \"%.2f\", r}")
+    bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
+fi
+
+# Get connection count
+online=$(pgrep -c -u "$user" sshd 2>/dev/null || echo 0)
+conn_info="${online}/${limit}"
+
+# Display the banner
+echo ""
+echo "========================================"
+echo "   FirewallFalcon VPN - Account Info"
+echo "========================================"
+echo " User:       $user"
+echo " Expires:    $expiry ($days_left)"
+echo " Bandwidth:  $bw_info"
+echo " Sessions:   $conn_info"
+echo "========================================"
+echo ""
+
+# Keep tunnel alive (sleep until connection drops)
+sleep infinity &
+wait
+LOGINEOF
+    chmod +x "$LOGIN_INFO_SCRIPT"
+    
+    # Create sshd config drop-in for managed users
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > "$SSHD_FF_CONFIG" << SSHEOF
+# FirewallFalcon - Show login info for managed users
+Match Group ffusers
+    ForceCommand $LOGIN_INFO_SCRIPT
+    AllowTcpForwarding yes
+    PermitTunnel yes
+    X11Forwarding no
+SSHEOF
+    
+    # Ensure sshd_config includes the config.d directory
+    if ! grep -q "^Include /etc/ssh/sshd_config.d/" /etc/ssh/sshd_config 2>/dev/null; then
+        echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
+    fi
+    
+    # Reload SSH to apply
+    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+}
+
 
 generate_dns_record() {
     echo -e "\n${C_BLUE}⚙️ Generating a random domain...${C_RESET}"
@@ -624,7 +742,9 @@ create_user() {
     if ! [[ "$bandwidth_gb" =~ ^[0-9]+\.?[0-9]*$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
     local expire_date
     expire_date=$(date -d "+$days days" +%Y-%m-%d)
-    useradd -m -s /usr/sbin/nologin "$username"; echo "$username:$password" | chpasswd; chage -E "$expire_date" "$username"
+    useradd -m -s /usr/sbin/nologin "$username"
+    usermod -aG ffusers "$username" 2>/dev/null
+    echo "$username:$password" | chpasswd; chage -E "$expire_date" "$username"
     echo "$username:$password:$expire_date:$limit:$bandwidth_gb" >> "$DB_FILE"
     
     local bw_display="Unlimited"
@@ -1034,6 +1154,7 @@ restore_user_data() {
         if ! id "$user" &>/dev/null; then
             echo " - User does not exist in system. Creating..."
             useradd -m -s /usr/sbin/nologin "$user"
+            usermod -aG ffusers "$user" 2>/dev/null
         fi
         echo " - Setting password..."
         echo "$user:$pass" | chpasswd
@@ -2658,6 +2779,11 @@ uninstall_script() {
     rm -f "$BANDWIDTH_SCRIPT"
     rm -f "$TRIAL_CLEANUP_SCRIPT"
     
+    echo -e "\n${C_BLUE}\ud83d\uddd1\ufe0f Removing SSH login banner...${C_RESET}"
+    rm -f "$LOGIN_INFO_SCRIPT"
+    rm -f "$SSHD_FF_CONFIG"
+    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+    
     chattr -i /etc/resolv.conf &>/dev/null
 
     purge_nginx "silent"
@@ -2781,6 +2907,7 @@ create_trial_account() {
     
     # Create the system user
     useradd -m -s /usr/sbin/nologin "$username"
+    usermod -aG ffusers "$username" 2>/dev/null
     echo "$username:$password" | chpasswd
     chage -E "$expire_date" "$username"
     echo "$username:$password:$expire_date:$limit:$bandwidth_gb" >> "$DB_FILE"
@@ -2911,6 +3038,7 @@ bulk_create_users() {
         fi
         local password=$(head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 8)
         useradd -m -s /usr/sbin/nologin "$username"
+        usermod -aG ffusers "$username" 2>/dev/null
         echo "$username:$password" | chpasswd
         chage -E "$expire_date" "$username"
         echo "$username:$password:$expire_date:$limit:$bandwidth_gb" >> "$DB_FILE"
@@ -3216,6 +3344,56 @@ _flush_torrent_rules() {
     iptables -D OUTPUT -m string --string "info_hash" --algo bm -j DROP 2>/dev/null
     iptables -D OUTPUT -m string --string "get_peers" --algo bm -j DROP 2>/dev/null
     iptables -D OUTPUT -m string --string "find_node" --algo bm -j DROP 2>/dev/null
+}
+
+ssh_banner_menu() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 🎨 SSH Login Banner ---${C_RESET}"
+    
+    echo -e "\n${C_CYAN}When enabled, users connecting via SSH tunnel (HTTP Custom,"
+    echo -e "HTTP Injector, etc.) will see their account details:${C_RESET}"
+    echo -e "  • Days/hours remaining"
+    echo -e "  • Bandwidth used and remaining"
+    echo -e "  • Active sessions count"
+    
+    # Check current status
+    if [[ -f "$SSHD_FF_CONFIG" ]]; then
+        echo -e "\n  Status: ${C_GREEN}✅ ENABLED${C_RESET}"
+    else
+        echo -e "\n  Status: ${C_RED}❌ DISABLED${C_RESET}"
+    fi
+    
+    echo -e "\n${C_BOLD}Options:${C_RESET}\n"
+    printf "  ${C_CHOICE}[ 1]${C_RESET} %-35s\n" "✅ Enable Login Banner"
+    printf "  ${C_CHOICE}[ 2]${C_RESET} %-35s\n" "❌ Disable Login Banner"
+    printf "  ${C_CHOICE}[ 3]${C_RESET} %-35s\n" "📝 Preview Banner (test with a user)"
+    echo -e "\n  ${C_WARN}[ 0]${C_RESET} ↩️ Return"
+    echo
+    read -p "👉 Enter choice: " banner_choice
+    case $banner_choice in
+        1)
+            setup_ssh_login_info
+            echo -e "\n${C_GREEN}✅ SSH Login Banner has been enabled!${C_RESET}"
+            echo -e "${C_DIM}Users will see account info when they connect via SSH tunnel.${C_RESET}"
+            press_enter
+            ;;
+        2)
+            rm -f "$SSHD_FF_CONFIG"
+            systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+            echo -e "\n${C_YELLOW}❌ SSH Login Banner has been disabled.${C_RESET}"
+            press_enter
+            ;;
+        3)
+            _select_user_interface "--- 📝 Preview Login Banner ---"
+            local u=$SELECTED_USER
+            if [[ -z "$u" || "$u" == "NO_USERS" ]]; then return; fi
+            echo -e "\n${C_CYAN}--- Banner Preview for user '$u' ---${C_RESET}\n"
+            # Run the banner script as the user
+            su -s /bin/bash -c "$LOGIN_INFO_SCRIPT & sleep 1; kill %1 2>/dev/null" "$u" 2>/dev/null
+            press_enter
+            ;;
+        *) return ;;
+    esac
 }
 
 auto_reboot_menu() {
