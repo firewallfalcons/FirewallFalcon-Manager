@@ -290,6 +290,7 @@ while true; do
             echo -e "<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
             echo -e "<font color=\"white\">📊 <b>Bandwidth  :</b> $bw_info</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
             echo -e "<font color=\"white\">🔌 <b>Sessions   :</b> $online_count/$limit</font><br><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+        fi
 
         
         # --- Bandwidth Check ---
