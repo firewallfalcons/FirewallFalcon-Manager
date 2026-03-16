@@ -3361,6 +3361,12 @@ ssh_banner_menu() {
             press_enter
             ;;
         3)
+            if [[ ! -f "/etc/firewallfalcon/banners_enabled" ]]; then
+                echo -e "\n${C_RED}❌ You must ENABLE the Login Banner (Option 1) before you can preview it!${C_RESET}"
+                echo -e "${C_YELLOW}The service only generates these files while the feature is active.${C_RESET}"
+                press_enter
+                return
+            fi
             _select_user_interface "--- 📝 Preview Login Banner ---"
             local u=$SELECTED_USER
             if [[ -z "$u" || "$u" == "NO_USERS" ]]; then return; fi
@@ -3370,7 +3376,12 @@ ssh_banner_menu() {
             else
                 echo -e "${C_RED}Banner file not generated yet. Waiting up to 15s for limiter to write it...${C_RESET}"
                 sleep 5
-                cat "/etc/firewallfalcon/banners/${u}.txt" 2>/dev/null || echo -e "${C_RED}Still not generated. Ensure the limiter service is running.${C_RESET}"
+                if ! cat "/etc/firewallfalcon/banners/${u}.txt" 2>/dev/null; then
+                    echo -e "\n${C_RED}Still not generated. The limiter service MUST be crashing! Here is the error log:${C_RESET}"
+                    echo -e "----------------------------------------------------------------------"
+                    journalctl -u firewallfalcon-limiter -n 15 --no-pager
+                    echo -e "----------------------------------------------------------------------"
+                fi
             fi
             press_enter
             ;;
