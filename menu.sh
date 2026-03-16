@@ -3362,6 +3362,11 @@ ssh_banner_menu() {
             press_enter
             ;;
         3)
+            # Force background service to regenerate to ensure the syntax error fix is applied
+            # even if the user didn't run the --install-setup command!
+            echo -e "${C_DIM}Re-syncing background limiter service...${C_RESET}"
+            setup_limiter_service >/dev/null 2>&1
+            
             if [[ ! -f "/etc/firewallfalcon/banners_enabled" ]]; then
                 echo -e "\n${C_RED}❌ You must ENABLE the Login Banner (Option 1) before you can preview it!${C_RESET}"
                 echo -e "${C_YELLOW}The service only generates these files while the feature is active.${C_RESET}"
