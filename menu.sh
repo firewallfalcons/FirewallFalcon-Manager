@@ -255,6 +255,47 @@ while true; do
             fi
         fi
         
+        # --- SSH Banner Generation (Delay of 1 cycle for BW stats is fine) ---
+        if [[ -d "/etc/firewallfalcon/banners" ]]; then
+            days_left="N/A"
+            if [[ "$expiry" != "Never" && -n "$expiry" ]]; then
+                if [[ $expiry_ts -gt 0 ]]; then
+                    diff_secs=$((expiry_ts - current_ts))
+                    if [[ $diff_secs -le 0 ]]; then
+                        days_left="EXPIRED"
+                    else
+                        d_l=$(( diff_secs / 86400 ))
+                        h_l=$(( (diff_secs % 86400) / 3600 ))
+                        if [[ $d_l -eq 0 ]]; then days_left="${h_l}h left"
+                        else days_left="${d_l}d ${h_l}h"; fi
+                    fi
+                fi
+            fi
+            
+            bw_info="Unlimited"
+            if [[ "$bandwidth_gb" != "0" && -n "$bandwidth_gb" ]]; then
+                usagefile="$BW_DIR/${user}.usage"
+                accum_disp=0
+                [[ -f "$usagefile" ]] && accum_disp=$(cat "$usagefile" 2>/dev/null)
+                used_gb=$(awk "BEGIN {printf \"%.2f\", $accum_disp / 1073741824}")
+                remain_gb=$(awk "BEGIN {r=$bandwidth_gb - $used_gb; if(r<0) r=0; printf \"%.2f\", r}")
+                bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
+            fi
+            
+            cat > "/etc/firewallfalcon/banners/${user}.txt" << BANNEREOF
+
+========================================
+   FirewallFalcon VPN - Account Info
+========================================
+ User:       $user
+ Expires:    $expiry ($days_left)
+ Bandwidth:  $bw_info
+ Sessions:   $online_count/$limit
+========================================
+
+BANNEREOF
+        fi
+        
         # --- Bandwidth Check ---
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
         
@@ -431,117 +472,42 @@ TREOF
     chmod +x "$TRIAL_CLEANUP_SCRIPT"
 }
 
-setup_ssh_login_info() {
-    # Create the ffusers group if it doesn't exist
-    getent group ffusers &>/dev/null || groupadd ffusers 2>/dev/null
+update_ssh_banners_config() {
+    rm -f /usr/local/bin/firewallfalcon-login-info.sh 2>/dev/null
     
-    # Add all existing DB users to the group
+    if [[ ! -f "/etc/firewallfalcon/banners_enabled" ]]; then
+        rm -f "$SSHD_FF_CONFIG" 2>/dev/null
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+        return
+    fi
+    
+    mkdir -p "/etc/firewallfalcon/banners" /etc/ssh/sshd_config.d
+    
+    tmp_conf="/tmp/ff_banners_new.conf"
+    echo "# FirewallFalcon - Show login info native banners" > "$tmp_conf"
+    
     if [[ -f "$DB_FILE" ]]; then
         while IFS=: read -r u _rest; do
             [[ -z "$u" || "$u" == \#* ]] && continue
-            id "$u" &>/dev/null && usermod -aG ffusers "$u" 2>/dev/null
+            echo "Match User $u" >> "$tmp_conf"
+            echo "    Banner /etc/firewallfalcon/banners/${u}.txt" >> "$tmp_conf"
         done < "$DB_FILE"
     fi
     
-    # Create the login info wrapper script
-    cat > "$LOGIN_INFO_SCRIPT" << 'LOGINEOF'
-#!/bin/bash
-# FirewallFalcon SSH Login Info Banner
-# Shows account details when user connects via SSH tunnel
-
-DB_FILE="/etc/firewallfalcon/users.db"
-BW_DIR="/etc/firewallfalcon/bandwidth"
-user=$(whoami)
-
-# Read user info from DB
-line=$(grep "^${user}:" "$DB_FILE" 2>/dev/null)
-if [[ -z "$line" ]]; then
-    # Not a managed user, just sleep to keep tunnel alive
-    sleep infinity &
-    wait
-    exit 0
-fi
-
-expiry=$(echo "$line" | cut -d: -f3)
-limit=$(echo "$line" | cut -d: -f4)
-bandwidth_gb=$(echo "$line" | cut -d: -f5)
-[[ -z "$bandwidth_gb" ]] && bandwidth_gb="0"
-
-# Calculate days remaining
-days_left="N/A"
-if [[ "$expiry" != "Never" && -n "$expiry" ]]; then
-    expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
-    current_ts=$(date +%s)
-    if [[ $expiry_ts -gt 0 ]]; then
-        diff_secs=$((expiry_ts - current_ts))
-        if [[ $diff_secs -le 0 ]]; then
-            days_left="EXPIRED"
-        else
-            days_left=$(( diff_secs / 86400 ))
-            hours_left=$(( (diff_secs % 86400) / 3600 ))
-            if [[ $days_left -eq 0 ]]; then
-                days_left="${hours_left}h left"
-            else
-                days_left="${days_left}d ${hours_left}h"
-            fi
+    if ! cmp -s "$tmp_conf" "$SSHD_FF_CONFIG" 2>/dev/null; then
+        mv "$tmp_conf" "$SSHD_FF_CONFIG"
+        if ! grep -q "^Include /etc/ssh/sshd_config.d/" /etc/ssh/sshd_config 2>/dev/null; then
+            echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
         fi
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+    else
+        rm -f "$tmp_conf"
     fi
-fi
+}
 
-# Calculate bandwidth info
-bw_info="Unlimited"
-if [[ "$bandwidth_gb" != "0" ]]; then
-    usage_file="$BW_DIR/${user}.usage"
-    used_bytes=0
-    if [[ -f "$usage_file" ]]; then
-        used_bytes=$(cat "$usage_file" 2>/dev/null)
-        [[ -z "$used_bytes" ]] && used_bytes=0
-    fi
-    used_gb=$(awk "BEGIN {printf \"%.2f\", $used_bytes / 1073741824}")
-    remain_gb=$(awk "BEGIN {r=$bandwidth_gb - $used_gb; if(r<0) r=0; printf \"%.2f\", r}")
-    bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
-fi
-
-# Get connection count
-online=$(pgrep -c -u "$user" sshd 2>/dev/null || echo 0)
-conn_info="${online}/${limit}"
-
-# Display the banner
-echo ""
-echo "========================================"
-echo "   FirewallFalcon VPN - Account Info"
-echo "========================================"
-echo " User:       $user"
-echo " Expires:    $expiry ($days_left)"
-echo " Bandwidth:  $bw_info"
-echo " Sessions:   $conn_info"
-echo "========================================"
-echo ""
-
-# Keep tunnel alive (sleep until connection drops)
-sleep infinity &
-wait
-LOGINEOF
-    chmod +x "$LOGIN_INFO_SCRIPT"
-    
-    # Create sshd config drop-in for managed users
-    mkdir -p /etc/ssh/sshd_config.d
-    cat > "$SSHD_FF_CONFIG" << SSHEOF
-# FirewallFalcon - Show login info for managed users
-Match Group ffusers
-    ForceCommand $LOGIN_INFO_SCRIPT
-    AllowTcpForwarding yes
-    PermitTunnel yes
-    X11Forwarding no
-SSHEOF
-    
-    # Ensure sshd_config includes the config.d directory
-    if ! grep -q "^Include /etc/ssh/sshd_config.d/" /etc/ssh/sshd_config 2>/dev/null; then
-        echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
-    fi
-    
-    # Reload SSH to apply
-    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+setup_ssh_login_info() {
+    touch "/etc/firewallfalcon/banners_enabled"
+    update_ssh_banners_config
 }
 
 
@@ -765,6 +731,8 @@ create_user() {
     if [[ "$gen_conf" == "y" || "$gen_conf" == "Y" ]]; then
         generate_client_config "$username" "$password"
     fi
+    
+    update_ssh_banners_config
 }
 
 delete_user() {
@@ -817,6 +785,8 @@ delete_user() {
 
     sed -i "/^$username:/d" "$DB_FILE"
     echo -e "${C_GREEN}✅ User '$username' has been completely removed.${C_RESET}"
+    
+    update_ssh_banners_config
 }
 
 edit_user() {
@@ -1076,6 +1046,7 @@ cleanup_expired() {
             sed -i "/^$user:/d" "$DB_FILE"
         done
         echo -e "\n${C_GREEN}✅ Expired users have been cleaned up.${C_RESET}"
+        update_ssh_banners_config
     else
         echo -e "\n${C_YELLOW}❌ Cleanup cancelled.${C_RESET}"
     fi
@@ -1164,6 +1135,8 @@ restore_user_data() {
     done < "$DB_FILE"
     rm -rf "$temp_dir"
     echo -e "\n${C_GREEN}✅ SUCCESS: User data restore completed.${C_RESET}"
+    
+    update_ssh_banners_config
 }
 
 _enable_banner_in_sshd_config() {
@@ -2938,6 +2911,8 @@ create_trial_account() {
     if [[ "$gen_conf" == "y" || "$gen_conf" == "Y" ]]; then
         generate_client_config "$username" "$password"
     fi
+    
+    update_ssh_banners_config
 }
 
 view_user_bandwidth() {
@@ -3048,6 +3023,8 @@ bulk_create_users() {
     
     echo -e "${C_YELLOW}================================================================${C_RESET}"
     echo -e "\n${C_GREEN}✅ Created $created users. Conn Limit: ${limit} | BW: ${bw_display}${C_RESET}"
+    
+    update_ssh_banners_config
 }
 
 generate_client_config() {
@@ -3372,14 +3349,15 @@ ssh_banner_menu() {
     read -p "👉 Enter choice: " banner_choice
     case $banner_choice in
         1)
-            setup_ssh_login_info
+            touch "/etc/firewallfalcon/banners_enabled"
+            update_ssh_banners_config
             echo -e "\n${C_GREEN}✅ SSH Login Banner has been enabled!${C_RESET}"
             echo -e "${C_DIM}Users will see account info when they connect via SSH tunnel.${C_RESET}"
             press_enter
             ;;
         2)
-            rm -f "$SSHD_FF_CONFIG"
-            systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+            rm -f "/etc/firewallfalcon/banners_enabled"
+            update_ssh_banners_config
             echo -e "\n${C_YELLOW}❌ SSH Login Banner has been disabled.${C_RESET}"
             press_enter
             ;;
@@ -3388,8 +3366,13 @@ ssh_banner_menu() {
             local u=$SELECTED_USER
             if [[ -z "$u" || "$u" == "NO_USERS" ]]; then return; fi
             echo -e "\n${C_CYAN}--- Banner Preview for user '$u' ---${C_RESET}\n"
-            # Run the banner script as the user
-            su -s /bin/bash -c "$LOGIN_INFO_SCRIPT & sleep 1; kill %1 2>/dev/null" "$u" 2>/dev/null
+            if [[ -f "/etc/firewallfalcon/banners/${u}.txt" ]]; then
+                cat "/etc/firewallfalcon/banners/${u}.txt"
+            else
+                echo -e "${C_RED}Banner file not generated yet. Waiting up to 15s for limiter to write it...${C_RESET}"
+                sleep 5
+                cat "/etc/firewallfalcon/banners/${u}.txt" 2>/dev/null || echo -e "${C_RED}Still not generated. Ensure the limiter service is running.${C_RESET}"
+            fi
             press_enter
             ;;
         *) return ;;
