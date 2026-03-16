@@ -283,16 +283,15 @@ while true; do
             fi
             
             # Format the output with HTML tags since clients like HTTP Custom render Server Messages using Html.fromHtml()
-            cat > "/etc/firewallfalcon/banners/${user}.txt" << BANNEREOF
-<font color="cyan"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>
-<font color="yellow"><b>          ✨ ACCOUNT STATUS ✨          </b></font><br>
-<font color="cyan"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>
-<font color="white">👤 <b>Username   :</b> $user</font><br>
-<font color="white">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>
-<font color="white">📊 <b>Bandwidth  :</b> $bw_info</font><br>
-<font color="white">🔌 <b>Sessions   :</b> $online_count/$limit</font><br>
-<font color="cyan"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>
-BANNEREOF
+            # Crucial: Use echo -e instead of heredoc to prevent DOS CRLF syntax errors when moving script to Linux
+            echo -e "<font color=\"cyan\"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>" > "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"yellow\"><b>          ✨ ACCOUNT STATUS ✨          </b></font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"cyan\"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">👤 <b>Username   :</b> $user</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">📊 <b>Bandwidth  :</b> $bw_info</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">🔌 <b>Sessions   :</b> $online_count/$limit</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"cyan\"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
 
         
         # --- Bandwidth Check ---
