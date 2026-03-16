@@ -282,16 +282,18 @@ while true; do
                 bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
             fi
             
-            # Use echo -e with \r to ensure tunneling clients like HTTP Custom respect newlines
-            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\r" > "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "          ✨ 𝗔𝗖𝗖𝗢𝗨𝗡𝗧 𝗦𝗧𝗔𝗧𝗨𝗦 ✨          \r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 👤 𝗨𝘀𝗲𝗿𝗻𝗮𝗺𝗲   : $user\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 📅 𝗘𝘅𝗽𝗶𝗿𝗮𝘁𝗶𝗼𝗻 : $expiry ($days_left)\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 📊 𝗕𝗮𝗻𝗱𝘄𝗶𝗱𝘁𝗵  : $bw_info\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 🔌 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀   : $online_count/$limit\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-        fi
+            # Format the output with HTML tags since clients like HTTP Custom render Server Messages using Html.fromHtml()
+            cat > "/etc/firewallfalcon/banners/${user}.txt" << BANNEREOF
+<font color="cyan"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>
+<font color="yellow"><b>          ✨ ACCOUNT STATUS ✨          </b></font><br>
+<font color="cyan"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>
+<font color="white">👤 <b>Username   :</b> $user</font><br>
+<font color="white">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>
+<font color="white">📊 <b>Bandwidth  :</b> $bw_info</font><br>
+<font color="white">🔌 <b>Sessions   :</b> $online_count/$limit</font><br>
+<font color="cyan"><b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b></font><br>
+BANNEREOF
+
         
         # --- Bandwidth Check ---
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
