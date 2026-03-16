@@ -256,7 +256,8 @@ while true; do
         fi
         
         # --- SSH Banner Generation (Delay of 1 cycle for BW stats is fine) ---
-        if [[ -d "/etc/firewallfalcon/banners" ]]; then
+        if [[ -f "/etc/firewallfalcon/banners_enabled" ]]; then
+            mkdir -p "/etc/firewallfalcon/banners"
             days_left="N/A"
             if [[ "$expiry" != "Never" && -n "$expiry" ]]; then
                 if [[ $expiry_ts -gt 0 ]]; then
@@ -282,16 +283,14 @@ while true; do
                 bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
             fi
             
-            # Use echo -e with \r to ensure tunneling clients like HTTP Custom respect newlines
-            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\r" > "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "          ✨ 𝗔𝗖𝗖𝗢𝗨𝗡𝗧 𝗦𝗧𝗔𝗧𝗨𝗦 ✨          \r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 👤 𝗨𝘀𝗲𝗿𝗻𝗮𝗺𝗲   : $user\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 📅 𝗘𝘅𝗽𝗶𝗿𝗮𝘁𝗶𝗼𝗻 : $expiry ($days_left)\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 📊 𝗕𝗮𝗻𝗱𝘄𝗶𝗱𝘁𝗵  : $bw_info\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e " 🔌 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀   : $online_count/$limit\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\r" >> "/etc/firewallfalcon/banners/${user}.txt"
-        fi
+            # Format the output with HTML tags since clients like HTTP Custom render Server Messages using Html.fromHtml()
+            # Crucial: Use echo -e instead of heredoc to prevent DOS CRLF syntax errors when moving script to Linux
+            echo -e "<br><font color=\"yellow\"><b>      ✨ ACCOUNT STATUS ✨      </b></font><br><br>" > "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">👤 <b>Username   :</b> $user</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">📊 <b>Bandwidth  :</b> $bw_info</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+            echo -e "<font color=\"white\">🔌 <b>Sessions   :</b> $online_count/$limit</font><br><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+
         
         # --- Bandwidth Check ---
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
@@ -401,6 +400,8 @@ while true; do
 done
 EOF
     chmod +x "$LIMITER_SCRIPT"
+    # Strip DOS line endings in case menu.sh was uploaded from Windows
+    sed -i 's/\r$//' "$LIMITER_SCRIPT" 2>/dev/null
 
     cat > "$LIMITER_SERVICE" << EOF
 [Unit]
@@ -416,6 +417,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    sed -i 's/\r$//' "$LIMITER_SERVICE" 2>/dev/null
 
     pkill -f "firewallfalcon-limiter" 2>/dev/null
 
