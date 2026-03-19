@@ -630,12 +630,20 @@ _select_user_interface() {
         echo -e "${C_YELLOW}ℹ️ No users found in the database.${C_RESET}"
         SELECTED_USER="NO_USERS"; return
     fi
-    read -p "👉 Enter a search term (or press Enter to list all): " search_term
-    if [[ -z "$search_term" ]]; then
-        mapfile -t users < <(cut -d: -f1 "$DB_FILE" | sort)
+    
+    mapfile -t all_users < <(cut -d: -f1 "$DB_FILE" | sort)
+    
+    if [ ${#all_users[@]} -ge 15 ]; then
+        read -p "👉 Enter a search term (or press Enter to list all): " search_term
+        if [[ -n "$search_term" ]]; then
+            mapfile -t users < <(printf "%s\n" "${all_users[@]}" | grep -i "$search_term")
+        else
+            users=("${all_users[@]}")
+        fi
     else
-        mapfile -t users < <(cut -d: -f1 "$DB_FILE" | grep -i "$search_term" | sort)
+        users=("${all_users[@]}")
     fi
+
     if [ ${#users[@]} -eq 0 ]; then
         echo -e "\n${C_YELLOW}ℹ️ No users found matching your criteria.${C_RESET}"
         SELECTED_USER="NO_USERS"; return
@@ -657,6 +665,102 @@ _select_user_interface() {
             fi
         else
             echo -e "${C_RED}❌ Invalid selection. Please try again.${C_RESET}"
+        fi
+    done
+}
+
+_select_multi_user_interface() {
+    local title="$1"
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}${title}${C_RESET}\n"
+    SELECTED_USERS=()
+    if [[ ! -s $DB_FILE ]]; then
+        echo -e "${C_YELLOW}ℹ️ No users found in the database.${C_RESET}"
+        SELECTED_USERS=("NO_USERS"); return
+    fi
+    
+    mapfile -t all_users < <(cut -d: -f1 "$DB_FILE" | sort)
+    
+    if [ ${#all_users[@]} -ge 15 ]; then
+        read -p "👉 Enter a search term (or press Enter to list all): " search_term
+        if [[ -n "$search_term" ]]; then
+            mapfile -t users < <(printf "%s\n" "${all_users[@]}" | grep -i "$search_term")
+        else
+            users=("${all_users[@]}")
+        fi
+    else
+        users=("${all_users[@]}")
+    fi
+
+    if [ ${#users[@]} -eq 0 ]; then
+        echo -e "\n${C_YELLOW}ℹ️ No users found matching your criteria.${C_RESET}"
+        SELECTED_USERS=("NO_USERS"); return
+    fi
+    echo -e "\nPlease select users:\n"
+    for i in "${!users[@]}"; do
+        printf "  ${C_GREEN}[%2d]${C_RESET} %s\n" "$((i+1))" "${users[$i]}"
+    done
+    echo -e "\n  ${C_GREEN}[all]${C_RESET} Select ALL listed users"
+    echo -e "  ${C_RED}  [0]${C_RESET} ↩️ Cancel and return to main menu"
+    echo -e "\n${C_CYAN}💡 You can select multiple! (e.g. '1 3 5' or '1,3' or '1-4')${C_RESET}"
+    echo
+    local choice
+    while true; do
+        read -p "👉 Enter user numbers: " choice
+        choice=$(echo "$choice" | tr ',' ' ') # Replace commas with spaces
+        
+        if [[ -z "$choice" ]]; then
+            echo -e "${C_RED}❌ Invalid selection. Please try again.${C_RESET}"
+            continue
+        fi
+
+        if [[ "$choice" == "0" ]]; then
+            SELECTED_USERS=(); return
+        fi
+        
+        if [[ "${choice,,}" == "all" ]]; then
+            SELECTED_USERS=("${users[@]}")
+            return
+        fi
+        
+        local valid=true
+        local selected_indices=()
+        for token in $choice; do
+            if [[ "$token" =~ ^[0-9]+-[0-9]+$ ]]; then
+                local start=${token%-*}
+                local end=${token#*-}
+                if [ "$start" -le "$end" ]; then
+                    for (( idx=start; idx<=end; idx++ )); do
+                        if [ "$idx" -ge 1 ] && [ "$idx" -le "${#users[@]}" ]; then
+                            selected_indices+=($idx)
+                        else
+                            valid=false; break
+                        fi
+                    done
+                else
+                    valid=false; break
+                fi
+            elif [[ "$token" =~ ^[0-9]+$ ]]; then
+                if [ "$token" -ge 1 ] && [ "$token" -le "${#users[@]}" ]; then
+                    selected_indices+=($token)
+                else
+                    valid=false; break
+                fi
+            else
+                valid=false; break
+            fi
+        done
+        
+        if [[ "$valid" == true && ${#selected_indices[@]} -gt 0 ]]; then
+            mapfile -t unique_indices < <(printf "%s\n" "${selected_indices[@]}" | sort -u -n)
+            for idx in "${unique_indices[@]}"; do
+                SELECTED_USERS+=("${users[$((idx-1))]}")
+            done
+            return
+        else
+            echo -e "${C_RED}❌ Invalid selection. Please check your numbers.${C_RESET}"
+            SELECTED_USERS=()
+            selected_indices=()
         fi
     done
 }
@@ -698,7 +802,8 @@ create_user() {
             break
         fi
     done
-    read -p "🗓️ Enter account duration (in days): " days
+    read -p "🗓️ Enter account duration (in days) [30]: " days
+    days=${days:-30}
     if ! [[ "$days" =~ ^[0-9]+$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
     read -p "📶 Enter simultaneous connection limit [1]: " limit
     limit=${limit:-1}
@@ -736,55 +841,27 @@ create_user() {
 }
 
 delete_user() {
-    _select_user_interface "--- 🗑️ Delete a User (from DB) ---"
-    local username=$SELECTED_USER
+    _select_multi_user_interface "--- 🗑️ Delete Users (from DB) ---"
+    if [[ ${#SELECTED_USERS[@]} -eq 0 || "${SELECTED_USERS[0]}" == "NO_USERS" ]]; then return; fi
     
-    if [[ "$username" == "NO_USERS" ]] || [[ -z "$username" ]]; then
-        if [[ "$username" == "NO_USERS" ]]; then
-            echo -e "\n${C_YELLOW}ℹ️ No users found in database.${C_RESET}"
-        fi
-        
-        read -p "👉 Type username to MANUALLY delete (or '0' to cancel): " manual_user
-        if [[ "$manual_user" == "0" ]] || [[ -z "$manual_user" ]]; then
-            echo -e "\n${C_YELLOW}❌ Action cancelled.${C_RESET}"
-            return
-        fi
-        username="$manual_user"
-        
-        if ! id "$username" &>/dev/null; then
-             echo -e "\n${C_RED}❌ Error: User '$username' does not exist on this system.${C_RESET}"
-             return
-        fi
-        
-        if grep -q "^$username:" "$DB_FILE"; then
-            echo -e "\n${C_YELLOW}ℹ️ User '$username' is in the database. Please use the normal selection method.${C_RESET}"
-            echo -e "   For safety, manual deletion is only for users NOT in the database."
-            return
-        fi
-        
-        echo -e "${C_YELLOW}⚠️ User '$username' exists on the system but is NOT in the database.${C_RESET}"
-    fi
-
-    read -p "👉 Are you sure you want to PERMANENTLY delete '$username'? (y/n): " confirm
+    echo -e "\n${C_RED}⚠️ You selected ${#SELECTED_USERS[@]} user(s) to delete: ${C_YELLOW}${SELECTED_USERS[*]}${C_RESET}"
+    read -p "👉 Are you sure you want to PERMANENTLY delete them? (y/n): " confirm
     if [[ "$confirm" != "y" ]]; then echo -e "\n${C_YELLOW}❌ Deletion cancelled.${C_RESET}"; return; fi
     
-    echo -e "${C_BLUE}🔌 Force killing active connections for $username...${C_RESET}"
-    killall -u "$username" -9 &>/dev/null
-    sleep 1
-
-    userdel -r "$username" &>/dev/null
-    if [ $? -eq 0 ]; then
-         echo -e "\n${C_GREEN}✅ System user '$username' has been deleted.${C_RESET}"
-    else
-         echo -e "\n${C_RED}❌ Failed to delete system user '$username'.${C_RESET}"
-    fi
-
-    # Clean up bandwidth tracking
-    rm -f "$BANDWIDTH_DIR/${username}.usage"
-    rm -rf "$BANDWIDTH_DIR/pidtrack/${username}"
-
-    sed -i "/^$username:/d" "$DB_FILE"
-    echo -e "${C_GREEN}✅ User '$username' has been completely removed.${C_RESET}"
+    echo -e "\n${C_BLUE}🗑️ Deleting selected users...${C_RESET}"
+    for username in "${SELECTED_USERS[@]}"; do
+        killall -u "$username" -9 &>/dev/null
+        sleep 0.2
+        userdel -r "$username" &>/dev/null
+        if [ $? -eq 0 ]; then
+             echo -e " ✅ System user '${C_YELLOW}$username${C_RESET}' deleted."
+        else
+             echo -e " ❌ Failed to delete system user '${C_YELLOW}$username${C_RESET}'."
+        fi
+        rm -f "$BANDWIDTH_DIR/${username}.usage"
+        rm -rf "$BANDWIDTH_DIR/pidtrack/${username}"
+        sed -i "/^$username:/d" "$DB_FILE"
+    done
     
     update_ssh_banners_config
 }
@@ -875,74 +952,44 @@ edit_user() {
 }
 
 lock_user() {
-    _select_user_interface "--- 🔒 Lock a User (from DB) ---"
-    local u=$SELECTED_USER
-    if [[ "$u" == "NO_USERS" ]] || [[ -z "$u" ]]; then
-        if [[ "$u" == "NO_USERS" ]]; then
-            echo -e "\n${C_YELLOW}ℹ️ No users found in database.${C_RESET}"
-        fi
-        
-        read -p "👉 Type username to MANUALLY lock (or '0' to cancel): " manual_user
-        if [[ "$manual_user" == "0" ]] || [[ -z "$manual_user" ]]; then
-            echo -e "\n${C_YELLOW}❌ Action cancelled.${C_RESET}"
-            return
-        fi
-        u="$manual_user"
-        
+    _select_multi_user_interface "--- 🔒 Lock Users (from DB) ---"
+    if [[ ${#SELECTED_USERS[@]} -eq 0 || "${SELECTED_USERS[0]}" == "NO_USERS" ]]; then return; fi
+    
+    echo -e "\n${C_BLUE}🔒 Locking selected users...${C_RESET}"
+    for u in "${SELECTED_USERS[@]}"; do
         if ! id "$u" &>/dev/null; then
-             echo -e "\n${C_RED}❌ Error: User '$u' does not exist on this system.${C_RESET}"
-             return
+             echo -e " ❌ User '${C_YELLOW}$u${C_RESET}' does not exist on this system."
+             continue
         fi
         
-        if grep -q "^$u:" "$DB_FILE"; then
-             echo -e "\n${C_YELLOW}ℹ️ User '$u' is in the database. Use the normal selection method.${C_RESET}"
+        usermod -L "$u"
+        if [ $? -eq 0 ]; then
+            killall -u "$u" -9 &>/dev/null
+            echo -e " ✅ ${C_YELLOW}$u${C_RESET} locked and active sessions killed."
         else
-             echo -e "${C_YELLOW}⚠️ User '$u' exists on the system but is NOT in the database.${C_RESET}"
+            echo -e " ❌ Failed to lock ${C_YELLOW}$u${C_RESET}."
         fi
-    fi
-
-    usermod -L "$u"
-    if [ $? -eq 0 ]; then
-        killall -u "$u" -9 &>/dev/null
-        echo -e "\n${C_GREEN}✅ User '$u' has been locked and active sessions killed.${C_RESET}"
-    else
-        echo -e "\n${C_RED}❌ Failed to lock user '$u'.${C_RESET}"
-    fi
+    done
 }
 
 unlock_user() {
-    _select_user_interface "--- 🔓 Unlock a User (from DB) ---"
-    local u=$SELECTED_USER
-    if [[ "$u" == "NO_USERS" ]] || [[ -z "$u" ]]; then
-        if [[ "$u" == "NO_USERS" ]]; then
-            echo -e "\n${C_YELLOW}ℹ️ No users found in database.${C_RESET}"
-        fi
-        
-        read -p "👉 Type username to MANUALLY unlock (or '0' to cancel): " manual_user
-        if [[ "$manual_user" == "0" ]] || [[ -z "$manual_user" ]]; then
-            echo -e "\n${C_YELLOW}❌ Action cancelled.${C_RESET}"
-            return
-        fi
-        u="$manual_user"
-        
+    _select_multi_user_interface "--- 🔓 Unlock Users (from DB) ---"
+    if [[ ${#SELECTED_USERS[@]} -eq 0 || "${SELECTED_USERS[0]}" == "NO_USERS" ]]; then return; fi
+    
+    echo -e "\n${C_BLUE}🔓 Unlocking selected users...${C_RESET}"
+    for u in "${SELECTED_USERS[@]}"; do
         if ! id "$u" &>/dev/null; then
-             echo -e "\n${C_RED}❌ Error: User '$u' does not exist on this system.${C_RESET}"
-             return
+             echo -e " ❌ User '${C_YELLOW}$u${C_RESET}' does not exist on this system."
+             continue
         fi
         
-        if grep -q "^$u:" "$DB_FILE"; then
-             echo -e "\n${C_YELLOW}ℹ️ User '$u' is in the database. Use the normal selection method.${C_RESET}"
+        usermod -U "$u"
+        if [ $? -eq 0 ]; then
+            echo -e " ✅ ${C_YELLOW}$u${C_RESET} unlocked."
         else
-             echo -e "${C_YELLOW}⚠️ User '$u' exists on the system but is NOT in the database.${C_RESET}"
+            echo -e " ❌ Failed to unlock ${C_YELLOW}$u${C_RESET}."
         fi
-    fi
-
-    usermod -U "$u"
-    if [ $? -eq 0 ]; then
-        echo -e "\n${C_GREEN}✅ User '$u' has been unlocked.${C_RESET}"
-    else
-        echo -e "\n${C_RED}❌ Failed to unlock user '$u'.${C_RESET}"
-    fi
+    done
 }
 
 list_users() {
@@ -996,13 +1043,19 @@ list_users() {
 }
 
 renew_user() {
-    _select_user_interface "--- 🔄 Renew a User ---"; local u=$SELECTED_USER; if [[ "$u" == "NO_USERS" || -z "$u" ]]; then return; fi
-    read -p "👉 Enter number of days to extend the account: " days; if ! [[ "$days" =~ ^[0-9]+$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
-    local new_expire_date; new_expire_date=$(date -d "+$days days" +%Y-%m-%d); chage -E "$new_expire_date" "$u"
-    local line; line=$(grep "^$u:" "$DB_FILE"); local pass; pass=$(echo "$line"|cut -d: -f2); local limit; limit=$(echo "$line"|cut -d: -f4); local bw; bw=$(echo "$line"|cut -d: -f5)
-    [[ -z "$bw" ]] && bw="0"
-    sed -i "s/^$u:.*/$u:$pass:$new_expire_date:$limit:$bw/" "$DB_FILE"
-    echo -e "\n${C_GREEN}✅ User '$u' has been renewed. New expiration date is ${C_YELLOW}${new_expire_date}${C_RESET}."
+    _select_multi_user_interface "--- 🔄 Renew Users ---"
+    if [[ ${#SELECTED_USERS[@]} -eq 0 || "${SELECTED_USERS[0]}" == "NO_USERS" ]]; then return; fi
+    read -p "👉 Enter number of days to extend the account(s): " days; if ! [[ "$days" =~ ^[0-9]+$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
+    local new_expire_date; new_expire_date=$(date -d "+$days days" +%Y-%m-%d)
+    
+    echo -e "\n${C_BLUE}🔄 Renewing selected users for $days days...${C_RESET}"
+    for u in "${SELECTED_USERS[@]}"; do
+        chage -E "$new_expire_date" "$u"
+        local line; line=$(grep "^$u:" "$DB_FILE"); local pass; pass=$(echo "$line"|cut -d: -f2); local limit; limit=$(echo "$line"|cut -d: -f4); local bw; bw=$(echo "$line"|cut -d: -f5)
+        [[ -z "$bw" ]] && bw="0"
+        sed -i "s/^$u:.*/$u:$pass:$new_expire_date:$limit:$bw/" "$DB_FILE"
+        echo -e " ✅ ${C_YELLOW}$u${C_RESET} renewed until ${C_GREEN}${new_expire_date}${C_RESET}."
+    done
 }
 
 cleanup_expired() {
@@ -2619,106 +2672,6 @@ protocol_menu() {
     done
 }
 
-install_dt_proxy_full() {
-    clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Full DT Tunnel Installation ---${C_RESET}"
-    if [ -f "/usr/local/bin/main" ]; then
-        echo -e "\n${C_YELLOW}ℹ️ DT Proxy appears to be already installed.${C_RESET}"
-        echo -e "If you wish to reinstall, please uninstall it first."
-        return
-    fi
-
-    echo -e "\n${C_BLUE}--- Step 1 of 2: Installing DT Tunnel Mod ---${C_RESET}"
-    echo "This will download and run the prerequisite mod installer."
-    read -p "👉 Press [Enter] to continue or [Ctrl+C] to cancel."
-
-    if curl -sL https://raw.githubusercontent.com/firewallfalcons/ProxyMods/main/install.sh | bash; then
-        echo -e "\n${C_GREEN}✅ DT Tunnel Mod installed successfully.${C_RESET}"
-    else
-        echo -e "\n${C_RED}❌ ERROR: DT Tunnel Mod installation failed. Aborting.${C_RESET}"
-        return
-    fi
-
-    echo -e "\n${C_BLUE}--- Step 2 of 2: Installing DT Tunnel Proxy ---${C_RESET}"
-    echo "This will download and run the main DT Tunnel proxy installer."
-    read -p "👉 Press [Enter] to continue or [Ctrl+C] to cancel."
-
-    if bash <(curl -fsSL https://raw.githubusercontent.com/firewallfalcons/ProxyDT-Go-Releases/main/install.sh); then
-        echo -e "\n${C_GREEN}✅ DT Tunnel Proxy installed successfully.${C_RESET}"
-        echo -e "You can now manage it from the DT Proxy Management menu."
-    else
-        echo -e "\n${C_RED}❌ ERROR: DT Tunnel Proxy installation failed.${C_RESET}"
-    fi
-}
-
-launch_dt_proxy_menu() {
-    clear; show_banner
-    if [ -f "/usr/local/bin/main" ]; then
-        echo -e "\n${C_GREEN}✅ DT Proxy is installed. Launching its management panel...${C_RESET}"
-        sleep 2
-        /usr/local/bin/main
-    else
-        echo -e "\n${C_RED}❌ DT Proxy is not installed. Please use the install option first.${C_RESET}"
-    fi
-}
-
-uninstall_dt_proxy_full() {
-    clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🗑️ Uninstall DT Proxy (Mod + Proxy) ---${C_RESET}"
-    if [ ! -f "/usr/local/bin/proxy" ] && [ ! -f "/usr/local/bin/main" ]; then
-        echo -e "\n${C_YELLOW}ℹ️ DT Proxy is not installed. Nothing to do.${C_RESET}"
-        return
-    fi
-    read -p "👉 Are you sure you want to PERMANENTLY delete DT Proxy and all its services? (y/n): " confirm
-    if [[ "$confirm" != "y" ]]; then
-        echo -e "\n${C_YELLOW}❌ Uninstallation cancelled.${C_RESET}"
-        return
-    fi
-
-    echo -e "\n${C_BLUE}🛑 Stopping and disabling all DT Proxy services...${C_RESET}"
-    systemctl list-units --type=service --state=running | grep 'proxy-' | awk '{print $1}' | xargs -r systemctl stop
-    systemctl list-unit-files --type=service | grep 'proxy-' | awk '{print $1}' | xargs -r systemctl disable
-
-    echo -e "\n${C_BLUE}🗑️ Removing files...${C_RESET}"
-    rm -f /etc/systemd/system/proxy-*.service
-    systemctl daemon-reload
-    rm -f /usr/local/bin/proxy
-    rm -f /usr/local/bin/main
-    rm -f "$HOME/.proxy_token"
-    rm -f /var/log/proxy-*.log
-    rm -f /usr/local/bin/install_mod
-
-    echo -e "\n${C_GREEN}✅ DT Proxy has been successfully uninstalled.${C_RESET}"
-}
-
-dt_proxy_menu() {
-     while true; do
-        show_banner
-        local dt_proxy_status
-        if [ -f "/usr/local/bin/main" ] && [ -f "/usr/local/bin/proxy" ]; then
-            dt_proxy_status="${C_STATUS_A}(Installed)${C_RESET}"
-        else
-            dt_proxy_status="${C_STATUS_I}(Not Installed)${C_RESET}"
-        fi
-
-        echo -e "\n   ${C_TITLE}═════════════════[ ${C_BOLD}🚀 DT Proxy Management ${dt_proxy_status} ${C_RESET}${C_TITLE}]═════════════════${C_RESET}"
-        printf "     ${C_CHOICE}[ 1]${C_RESET} %-45s\n" "🚀 Install DT Tunnel (Mod + Proxy)"
-        printf "     ${C_CHOICE}[ 2]${C_RESET} %-45s\n" "▶️ Launch DT Tunnel Management Menu"
-        printf "     ${C_DANGER}[ 3]${C_RESET} %-45s\n" "🗑️ Uninstall DT Tunnel (Mod + Proxy)"
-        echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
-        echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
-        echo
-        read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
-        case $choice in
-            1) install_dt_proxy_full; press_enter ;;
-            2) launch_dt_proxy_menu; press_enter ;;
-            3) uninstall_dt_proxy_full; press_enter ;;
-            0) return ;;
-            *) invalid_option ;;
-        esac
-    done
-}
-
 uninstall_script() {
     clear; show_banner
     echo -e "${C_RED}=====================================================${C_RESET}"
@@ -2728,7 +2681,7 @@ uninstall_script() {
     echo -e " - The main command ($(command -v menu))"
     echo -e " - All configuration and user data ($DB_DIR)"
     echo -e " - The active limiter service ($LIMITER_SERVICE)"
-    echo -e " - All installed services (badvpn, udp-custom, SSL Tunnel, Nginx, DNSTT, FalconProxy)"
+    echo -e " - All installed services (badvpn, udp-custom, SSL Tunnel, Nginx, DNSTT)"
     echo -e "\n${C_RED}This action is irreversible.${C_RESET}"
     echo ""
     read -p "👉 Type 'yes' to confirm and proceed with uninstallation: " confirm
@@ -2984,7 +2937,8 @@ bulk_create_users() {
         echo -e "\n${C_RED}❌ Invalid count (1-100).${C_RESET}"; return
     fi
     
-    read -p "🗓️ Account duration (in days): " days
+    read -p "🗓️ Account duration (in days) [30]: " days
+    days=${days:-30}
     if ! [[ "$days" =~ ^[0-9]+$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
     
     read -p "📶 Connection limit per user [1]: " limit
@@ -3457,14 +3411,14 @@ main_menu() {
         
         echo
         echo -e "   ${C_TITLE}══════════════[ ${C_BOLD}🌐 VPN & PROTOCOLS ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "12" "🔌 Protocol Manager" "14" "📈 Traffic Monitor (Lite)"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "13" "DT Proxy Manager" "15" "🚫 Block Torrent (Anti-P2P)"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "12" "🔌 Protocol Manager" "13" "📈 Traffic Monitor (Lite)"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "14" "🚫 Block Torrent (Anti-P2P)"
 
         echo
         echo -e "   ${C_TITLE}══════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "16" "☁️  CloudFlare Free Domain" "19" "💾 Backup User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "17" "🎨 SSH Banner Config" "20" "📥 Restore User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "18" "🔄 Auto-Reboot Task" "21" "🧹 Cleanup Expired Users"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "15" "☁️  CloudFlare Free Domain" "18" "💾 Backup User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "16" "🎨 SSH Banner Config" "19" "📥 Restore User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "17" "🔄 Auto-Reboot Task" "20" "🧹 Cleanup Expired Users"
 
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
@@ -3485,16 +3439,15 @@ main_menu() {
             11) bulk_create_users; press_enter ;;
             
             12) protocol_menu ;;
-            13) dt_proxy_menu ;;
-            14) traffic_monitor_menu ;;
-            15) torrent_block_menu ;;
+            13) traffic_monitor_menu ;;
+            14) torrent_block_menu ;;
             
-            16) dns_menu; press_enter ;;
-            17) ssh_banner_menu ;;
-            18) auto_reboot_menu ;;
-            19) backup_user_data; press_enter ;;
-            20) restore_user_data; press_enter ;;
-            21) cleanup_expired; press_enter ;;
+            15) dns_menu; press_enter ;;
+            16) ssh_banner_menu ;;
+            17) auto_reboot_menu ;;
+            18) backup_user_data; press_enter ;;
+            19) restore_user_data; press_enter ;;
+            20) cleanup_expired; press_enter ;;
             
             99) uninstall_script ;;
             0) exit 0 ;;
