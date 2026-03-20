@@ -35,7 +35,15 @@ HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 NGINX_CONFIG_FILE="/etc/nginx/sites-available/default"
 SSL_CERT_DIR="/etc/firewallfalcon/ssl"
 SSL_CERT_FILE="$SSL_CERT_DIR/firewallfalcon.pem"
+SSL_CERT_CHAIN_FILE="$SSL_CERT_DIR/firewallfalcon.crt"
+SSL_CERT_KEY_FILE="$SSL_CERT_DIR/firewallfalcon.key"
+EDGE_CERT_INFO_FILE="$DB_DIR/edge_cert.conf"
 NGINX_PORTS_FILE="$DB_DIR/nginx_ports.conf"
+EDGE_PUBLIC_HTTP_PORT="80"
+EDGE_PUBLIC_TLS_PORT="443"
+NGINX_INTERNAL_HTTP_PORT="8880"
+NGINX_INTERNAL_TLS_PORT="8443"
+HAPROXY_INTERNAL_DECRYPT_PORT="10443"
 DNSTT_SERVICE_FILE="/etc/systemd/system/dnstt.service"
 DNSTT_BINARY="/usr/local/bin/dnstt-server"
 DNSTT_KEYS_DIR="/etc/firewallfalcon/dnstt"
@@ -176,7 +184,10 @@ check_and_free_ports() {
     for port in "${ports_to_check[@]}"; do
         echo -e "\n${C_BLUE}🔎 Checking if port $port is available...${C_RESET}"
         local conflicting_process_info
-        conflicting_process_info=$(ss -lntp | grep ":$port\s" || ss -lunp | grep ":$port\s")
+        conflicting_process_info=$(
+            ss -H -lntp "( sport = :$port )" 2>/dev/null
+            ss -H -lunp "( sport = :$port )" 2>/dev/null
+        )
         
         if [[ -n "$conflicting_process_info" ]]; then
             local conflicting_pid
@@ -187,11 +198,15 @@ check_and_free_ports() {
             echo -e "${C_YELLOW}⚠️ Warning: Port $port is in use by process '${conflicting_name:-unknown}' (PID: ${conflicting_pid:-N/A}).${C_RESET}"
             read -p "👉 Do you want to attempt to stop this process? (y/n): " kill_confirm
             if [[ "$kill_confirm" == "y" || "$kill_confirm" == "Y" ]]; then
+                if [[ -z "$conflicting_pid" ]]; then
+                    echo -e "${C_RED}❌ Could not determine which PID owns port $port. Please free it manually.${C_RESET}"
+                    return 1
+                fi
                 echo -e "${C_GREEN}🛑 Stopping process PID $conflicting_pid...${C_RESET}"
                 systemctl stop "$(ps -p "$conflicting_pid" -o comm=)" &>/dev/null || kill -9 "$conflicting_pid"
                 sleep 2
                 
-                if ss -lntp | grep -q ":$port\s" || ss -lunp | grep -q ":$port\s"; then
+                if ss -H -lntp "( sport = :$port )" 2>/dev/null | grep -q . || ss -H -lunp "( sport = :$port )" 2>/dev/null | grep -q .; then
                      echo -e "${C_RED}❌ Failed to free port $port. Please handle it manually. Aborting.${C_RESET}"
                      return 1
                 else
@@ -1471,109 +1486,614 @@ uninstall_badvpn() {
     echo -e "${C_GREEN}✅ badvpn has been uninstalled successfully.${C_RESET}"
 }
 
-install_ssl_tunnel() {
-    clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing SSL Tunnel (HAProxy) for SSH ---${C_RESET}"
-    if ! command -v haproxy &> /dev/null; then
-        echo -e "\n${C_YELLOW}⚠️ HAProxy not found. Installing...${C_RESET}"
-        apt-get update && apt-get install -y haproxy || { echo -e "${C_RED}❌ Failed to install HAProxy.${C_RESET}"; return; }
+load_edge_cert_info() {
+    EDGE_CERT_MODE=""
+    EDGE_DOMAIN=""
+    EDGE_EMAIL=""
+    if [ -f "$EDGE_CERT_INFO_FILE" ]; then
+        source "$EDGE_CERT_INFO_FILE"
     fi
-    read -p "👉 Enter the port for the SSL tunnel [444]: " ssl_port
-    ssl_port=${ssl_port:-444}
-    if ! [[ "$ssl_port" =~ ^[0-9]+$ ]] || [ "$ssl_port" -lt 1 ] || [ "$ssl_port" -gt 65535 ]; then
-        echo -e "\n${C_RED}❌ Invalid port number. Aborting.${C_RESET}"
-        return
-    fi
-    
-    check_and_free_ports "$ssl_port" || return
-    check_and_open_firewall_port "$ssl_port" || return
+}
 
-    if [ -f "$SSL_CERT_FILE" ]; then
-        read -p "SSL certificate already exists. Overwrite? (y/n): " overwrite_cert
-        if [[ "$overwrite_cert" != "y" ]]; then
-            echo -e "${C_YELLOW}ℹ️ Using existing certificate.${C_RESET}"
-        else
-            rm -f "$SSL_CERT_FILE"
+save_edge_cert_info() {
+    local cert_mode="$1"
+    local cert_domain="$2"
+    local cert_email="$3"
+    mkdir -p "$DB_DIR"
+    cat > "$EDGE_CERT_INFO_FILE" <<EOF
+EDGE_CERT_MODE="$cert_mode"
+EDGE_DOMAIN="$cert_domain"
+EDGE_EMAIL="$cert_email"
+EOF
+}
+
+detect_preferred_host() {
+    local host_domain=""
+    load_edge_cert_info
+    if [[ -n "$EDGE_DOMAIN" ]]; then
+        host_domain="$EDGE_DOMAIN"
+    fi
+    if [[ -z "$host_domain" && -f "$DNS_INFO_FILE" ]]; then
+        host_domain=$(grep 'FULL_DOMAIN' "$DNS_INFO_FILE" | cut -d'"' -f2)
+    fi
+    if [[ -z "$host_domain" && -f "$NGINX_CONFIG_FILE" ]]; then
+        local nginx_domain
+        nginx_domain=$(grep -oP 'server_name \K[^\s;]+' "$NGINX_CONFIG_FILE" 2>/dev/null | head -n 1)
+        if [[ "$nginx_domain" != "_" && -n "$nginx_domain" ]]; then
+            host_domain="$nginx_domain"
         fi
     fi
-    if [ ! -f "$SSL_CERT_FILE" ]; then
-        echo -e "\n${C_GREEN}🔐 Generating self-signed SSL certificate...${C_RESET}"
-        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout "$SSL_CERT_FILE" -out "$SSL_CERT_FILE" \
-            -subj "/CN=@FIREWALLFALCON" \
-            >/dev/null 2>&1 || { echo -e "${C_RED}❌ Failed to generate SSL certificate.${C_RESET}"; return; }
-        echo -e "${C_GREEN}✅ Certificate created: ${C_YELLOW}$SSL_CERT_FILE${C_RESET}"
+    if [[ -z "$host_domain" ]]; then
+        host_domain=$(curl -s -4 icanhazip.com)
     fi
-    echo -e "\n${C_GREEN}📝 Creating HAProxy configuration for port $ssl_port...${C_RESET}"
-    cat > "$HAPROXY_CONFIG" <<-EOF
+    echo "$host_domain"
+}
+
+backup_edge_configs() {
+    if [ -f "$NGINX_CONFIG_FILE" ] && [ ! -f "${NGINX_CONFIG_FILE}.bak.firewallfalcon" ]; then
+        cp "$NGINX_CONFIG_FILE" "${NGINX_CONFIG_FILE}.bak.firewallfalcon" 2>/dev/null
+    fi
+    if [ -f "$HAPROXY_CONFIG" ] && [ ! -f "${HAPROXY_CONFIG}.bak.firewallfalcon" ]; then
+        cp "$HAPROXY_CONFIG" "${HAPROXY_CONFIG}.bak.firewallfalcon" 2>/dev/null
+    fi
+}
+
+ensure_edge_stack_packages() {
+    local missing_packages=()
+    command -v haproxy &> /dev/null || missing_packages+=("haproxy")
+    command -v nginx &> /dev/null || missing_packages+=("nginx")
+    command -v openssl &> /dev/null || missing_packages+=("openssl")
+
+    if (( ${#missing_packages[@]} > 0 )); then
+        echo -e "\n${C_BLUE}📦 Installing required packages: ${missing_packages[*]}${C_RESET}"
+        apt-get update && apt-get install -y "${missing_packages[@]}" || {
+            echo -e "${C_RED}❌ Failed to install the required packages.${C_RESET}"
+            return 1
+        }
+    fi
+    return 0
+}
+
+build_shared_tls_bundle() {
+    if [ ! -s "$SSL_CERT_CHAIN_FILE" ] || [ ! -s "$SSL_CERT_KEY_FILE" ]; then
+        echo -e "${C_RED}❌ Certificate chain or key is missing.${C_RESET}"
+        return 1
+    fi
+    cat "$SSL_CERT_CHAIN_FILE" "$SSL_CERT_KEY_FILE" > "$SSL_CERT_FILE" || return 1
+    chmod 644 "$SSL_CERT_CHAIN_FILE"
+    chmod 600 "$SSL_CERT_KEY_FILE" "$SSL_CERT_FILE"
+    return 0
+}
+
+generate_self_signed_edge_cert() {
+    local common_name="$1"
+    mkdir -p "$SSL_CERT_DIR"
+    echo -e "\n${C_GREEN}🔐 Generating a shared self-signed certificate...${C_RESET}"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout "$SSL_CERT_KEY_FILE" \
+        -out "$SSL_CERT_CHAIN_FILE" \
+        -subj "/CN=$common_name" \
+        >/dev/null 2>&1 || {
+            echo -e "${C_RED}❌ Failed to generate the self-signed certificate.${C_RESET}"
+            return 1
+        }
+    build_shared_tls_bundle || return 1
+    save_edge_cert_info "self-signed" "$common_name" ""
+    echo -e "${C_GREEN}✅ Shared certificate created for ${C_YELLOW}$common_name${C_RESET}"
+    return 0
+}
+
+_install_certbot() {
+    if command -v certbot &> /dev/null; then
+        echo -e "${C_GREEN}✅ Certbot is already installed.${C_RESET}"
+        return 0
+    fi
+    echo -e "${C_BLUE}📦 Installing Certbot...${C_RESET}"
+    apt-get update > /dev/null 2>&1
+    apt-get install -y certbot || {
+        echo -e "${C_RED}❌ Failed to install Certbot.${C_RESET}"
+        return 1
+    }
+    echo -e "${C_GREEN}✅ Certbot installed successfully.${C_RESET}"
+    return 0
+}
+
+obtain_certbot_edge_cert() {
+    local domain_name="$1"
+    local email="$2"
+    local restart_haproxy=0
+    local restart_nginx=0
+
+    mkdir -p "$SSL_CERT_DIR"
+    _install_certbot || return 1
+
+    if systemctl is-active --quiet haproxy; then restart_haproxy=1; fi
+    if systemctl is-active --quiet nginx; then restart_nginx=1; fi
+
+    echo -e "\n${C_BLUE}🛑 Stopping HAProxy and Nginx for Certbot validation...${C_RESET}"
+    systemctl stop haproxy >/dev/null 2>&1
+    systemctl stop nginx >/dev/null 2>&1
+    sleep 2
+
+    check_and_free_ports "$EDGE_PUBLIC_HTTP_PORT" "$EDGE_PUBLIC_TLS_PORT" || {
+        [[ "$restart_nginx" -eq 1 ]] && systemctl start nginx >/dev/null 2>&1
+        [[ "$restart_haproxy" -eq 1 ]] && systemctl start haproxy >/dev/null 2>&1
+        return 1
+    }
+
+    echo -e "\n${C_BLUE}🚀 Requesting a Certbot certificate for ${C_YELLOW}$domain_name${C_RESET}"
+    certbot certonly --standalone -d "$domain_name" --non-interactive --agree-tos -m "$email"
+    if [ $? -ne 0 ]; then
+        echo -e "\n${C_RED}❌ Certbot failed to obtain a certificate.${C_RESET}"
+        echo -e "${C_YELLOW}ℹ️ Make sure the domain points to this server and port 80 is reachable.${C_RESET}"
+        [[ "$restart_nginx" -eq 1 ]] && systemctl start nginx >/dev/null 2>&1
+        [[ "$restart_haproxy" -eq 1 ]] && systemctl start haproxy >/dev/null 2>&1
+        return 1
+    fi
+
+    local certbot_chain="/etc/letsencrypt/live/$domain_name/fullchain.pem"
+    local certbot_key="/etc/letsencrypt/live/$domain_name/privkey.pem"
+    if [ ! -f "$certbot_chain" ] || [ ! -f "$certbot_key" ]; then
+        echo -e "\n${C_RED}❌ Certbot completed, but the certificate files were not found.${C_RESET}"
+        [[ "$restart_nginx" -eq 1 ]] && systemctl start nginx >/dev/null 2>&1
+        [[ "$restart_haproxy" -eq 1 ]] && systemctl start haproxy >/dev/null 2>&1
+        return 1
+    fi
+
+    cp "$certbot_chain" "$SSL_CERT_CHAIN_FILE"
+    cp "$certbot_key" "$SSL_CERT_KEY_FILE"
+    build_shared_tls_bundle || {
+        [[ "$restart_nginx" -eq 1 ]] && systemctl start nginx >/dev/null 2>&1
+        [[ "$restart_haproxy" -eq 1 ]] && systemctl start haproxy >/dev/null 2>&1
+        return 1
+    }
+    save_edge_cert_info "certbot" "$domain_name" "$email"
+    echo -e "${C_GREEN}✅ Certbot certificate copied into ${C_YELLOW}$SSL_CERT_DIR${C_RESET}"
+    return 0
+}
+
+select_edge_certificate() {
+    local preferred_host
+    local cert_choice
+    local has_existing_cert=false
+
+    preferred_host=$(detect_preferred_host)
+    if [[ -z "$preferred_host" ]]; then
+        preferred_host="firewallfalcon.local"
+    fi
+
+    if [ -s "$SSL_CERT_FILE" ] && [ -s "$SSL_CERT_CHAIN_FILE" ] && [ -s "$SSL_CERT_KEY_FILE" ]; then
+        has_existing_cert=true
+    fi
+
+    load_edge_cert_info
+
+    echo -e "\n${C_BOLD}${C_PURPLE}--- 🔐 Shared TLS Certificate ---${C_RESET}"
+    echo -e "${C_DIM}The same certificate will be used by HAProxy and the internal Nginx proxy.${C_RESET}"
+
+    if $has_existing_cert; then
+        local existing_label="${EDGE_CERT_MODE:-existing}"
+        if [[ -n "$EDGE_DOMAIN" ]]; then
+            existing_label="$existing_label - $EDGE_DOMAIN"
+        fi
+        printf "  ${C_CHOICE}[ 1]${C_RESET} %-52s\n" "Reuse existing certificate (${existing_label})"
+        printf "  ${C_CHOICE}[ 2]${C_RESET} %-52s\n" "Replace with a new self-signed certificate"
+        printf "  ${C_CHOICE}[ 3]${C_RESET} %-52s\n" "Replace with a Certbot certificate"
+        echo
+        read -p "👉 Enter choice [1]: " cert_choice
+        cert_choice=${cert_choice:-1}
+    else
+        printf "  ${C_CHOICE}[ 1]${C_RESET} %-52s\n" "Generate a self-signed certificate"
+        printf "  ${C_CHOICE}[ 2]${C_RESET} %-52s\n" "Use a Certbot certificate"
+        echo
+        read -p "👉 Enter choice [1]: " cert_choice
+        cert_choice=${cert_choice:-1}
+    fi
+
+    case "$cert_choice" in
+        1)
+            if $has_existing_cert; then
+                echo -e "${C_GREEN}✅ Reusing the existing shared certificate.${C_RESET}"
+                return 0
+            fi
+            local common_name
+            read -p "👉 Enter the certificate Common Name / SNI label [$preferred_host]: " common_name
+            common_name=${common_name:-$preferred_host}
+            generate_self_signed_edge_cert "$common_name"
+            ;;
+        2)
+            if $has_existing_cert; then
+                local common_name
+                read -p "👉 Enter the certificate Common Name / SNI label [$preferred_host]: " common_name
+                common_name=${common_name:-$preferred_host}
+                generate_self_signed_edge_cert "$common_name"
+            else
+                local default_domain=""
+                local domain_name
+                local email
+                if ! _is_valid_ipv4 "$preferred_host"; then
+                    default_domain="$preferred_host"
+                fi
+                if [[ -n "$default_domain" ]]; then
+                    read -p "👉 Enter your domain name [$default_domain]: " domain_name
+                    domain_name=${domain_name:-$default_domain}
+                else
+                    read -p "👉 Enter your domain name (e.g. vpn.example.com): " domain_name
+                fi
+                if [[ -z "$domain_name" ]]; then
+                    echo -e "${C_RED}❌ Domain name cannot be empty.${C_RESET}"
+                    return 1
+                fi
+                if _is_valid_ipv4 "$domain_name"; then
+                    echo -e "${C_RED}❌ Certbot requires a real domain name, not a raw IP address.${C_RESET}"
+                    return 1
+                fi
+                read -p "👉 Enter your email for Let's Encrypt: " email
+                if [[ -z "$email" ]]; then
+                    echo -e "${C_RED}❌ Email cannot be empty.${C_RESET}"
+                    return 1
+                fi
+                obtain_certbot_edge_cert "$domain_name" "$email"
+            fi
+            ;;
+        3)
+            if ! $has_existing_cert; then
+                echo -e "${C_RED}❌ Invalid option.${C_RESET}"
+                return 1
+            fi
+            local default_domain=""
+            local domain_name
+            local email
+            if [[ -n "$EDGE_DOMAIN" ]] && ! _is_valid_ipv4 "$EDGE_DOMAIN"; then
+                default_domain="$EDGE_DOMAIN"
+            fi
+            if [[ -z "$default_domain" ]] && ! _is_valid_ipv4 "$preferred_host"; then
+                default_domain="$preferred_host"
+            fi
+            if [[ -n "$default_domain" ]]; then
+                read -p "👉 Enter your domain name [$default_domain]: " domain_name
+                domain_name=${domain_name:-$default_domain}
+            else
+                read -p "👉 Enter your domain name (e.g. vpn.example.com): " domain_name
+            fi
+            if [[ -z "$domain_name" ]]; then
+                echo -e "${C_RED}❌ Domain name cannot be empty.${C_RESET}"
+                return 1
+            fi
+            if _is_valid_ipv4 "$domain_name"; then
+                echo -e "${C_RED}❌ Certbot requires a real domain name, not a raw IP address.${C_RESET}"
+                return 1
+            fi
+            read -p "👉 Enter your email for Let's Encrypt [${EDGE_EMAIL}]: " email
+            email=${email:-$EDGE_EMAIL}
+            if [[ -z "$email" ]]; then
+                echo -e "${C_RED}❌ Email cannot be empty.${C_RESET}"
+                return 1
+            fi
+            obtain_certbot_edge_cert "$domain_name" "$email"
+            ;;
+        *)
+            echo -e "${C_RED}❌ Invalid option.${C_RESET}"
+            return 1
+            ;;
+    esac
+}
+
+write_internal_nginx_config() {
+    local server_name="$1"
+    [[ -z "$server_name" ]] && server_name="_"
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    cat > "$NGINX_CONFIG_FILE" <<EOF
+server {
+    listen 127.0.0.1:${NGINX_INTERNAL_HTTP_PORT} default_server;
+    listen 127.0.0.1:${NGINX_INTERNAL_TLS_PORT} ssl http2 default_server;
+    server_tokens off;
+    server_name ${server_name};
+
+    ssl_certificate ${SSL_CERT_CHAIN_FILE};
+    ssl_certificate_key ${SSL_CERT_KEY_FILE};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH:!SSLv3:!EXP:!PSK:!DSS;
+    resolver 1.1.1.1 8.8.8.8 ipv6=off valid=300s;
+
+    location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)$ {
+        client_max_body_size 0;
+        client_body_timeout 1d;
+        grpc_read_timeout 1d;
+        grpc_socket_keepalive on;
+        proxy_read_timeout 1d;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_socket_keepalive on;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        if (\$content_type ~* "GRPC") { grpc_pass grpc://127.0.0.1:\$fwdport\$is_args\$args; break; }
+        proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
+        break;
+    }
+
+    location / {
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_http_version 1.1;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
+        tcp_nopush off;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+EOF
+    ln -sf "$NGINX_CONFIG_FILE" /etc/nginx/sites-enabled/default
+}
+
+write_haproxy_edge_config() {
+    mkdir -p /etc/haproxy
+    cat > "$HAPROXY_CONFIG" <<EOF
 global
-    log /dev/log    local0
-    log /dev/log    local1 notice
+    log /dev/log local0
+    log /dev/log local1 notice
     chroot /var/lib/haproxy
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     stats timeout 30s
     user haproxy
     group haproxy
     daemon
+
 defaults
     log     global
     mode    tcp
     option  tcplog
     option  dontlognull
-    timeout connect 5000
-    timeout client  50000
-    timeout server  50000
-frontend ssh_ssl_in
-    bind *:$ssl_port ssl crt $SSL_CERT_FILE
+    timeout connect 5s
+    timeout client  24h
+    timeout server  24h
+
+# ====================================================================
+# TIER 1: PORT ${EDGE_PUBLIC_HTTP_PORT} (Cleartext Payloads & Raw SSH)
+# ====================================================================
+frontend port_80_edge
+    bind *:${EDGE_PUBLIC_HTTP_PORT}
     mode tcp
-    default_backend ssh_backend
-backend ssh_backend
+    tcp-request inspect-delay 2s
+
+    acl is_ssh payload(0,7) -m bin 5353482d322e30
+
+    tcp-request content accept if is_ssh
+    tcp-request content accept if HTTP
+
+    use_backend direct_ssh if is_ssh
+    default_backend nginx_cleartext
+
+# ====================================================================
+# TIER 1: PORT ${EDGE_PUBLIC_TLS_PORT} (TLS v2ray, SSL Payloads, Raw SSH)
+# ====================================================================
+frontend port_443_edge
+    bind *:${EDGE_PUBLIC_TLS_PORT}
+    mode tcp
+    tcp-request inspect-delay 2s
+
+    acl is_ssh payload(0,7) -m bin 5353482d322e30
+    acl is_tls req.ssl_hello_type 1
+    acl has_web_alpn req.ssl_alpn -m sub h2 http/1.1
+
+    tcp-request content accept if is_ssh
+    tcp-request content accept if HTTP
+    tcp-request content accept if is_tls
+
+    use_backend direct_ssh if is_ssh
+    use_backend nginx_cleartext if HTTP
+    use_backend nginx_tls if is_tls has_web_alpn
+    default_backend loopback_ssl_terminator
+
+# ====================================================================
+# TIER 2: INTERNAL DECRYPTOR (Only for Any-SNI SSH-TLS)
+# ====================================================================
+frontend internal_decryptor
+    bind 127.0.0.1:${HAPROXY_INTERNAL_DECRYPT_PORT} ssl crt ${SSL_CERT_FILE}
+    mode tcp
+    tcp-request inspect-delay 2s
+
+    acl is_ssh payload(0,7) -m bin 5353482d322e30
+    tcp-request content accept if is_ssh
+    tcp-request content accept if HTTP
+
+    use_backend direct_ssh if is_ssh
+    default_backend nginx_cleartext
+
+# ====================================================================
+# DESTINATION BACKENDS (Clean handoffs, no proxy headers)
+# ====================================================================
+backend direct_ssh
     mode tcp
     server ssh_server 127.0.0.1:22
+
+backend nginx_cleartext
+    mode tcp
+    server nginx_8880 127.0.0.1:${NGINX_INTERNAL_HTTP_PORT}
+
+backend nginx_tls
+    mode tcp
+    server nginx_8443 127.0.0.1:${NGINX_INTERNAL_TLS_PORT}
+
+backend loopback_ssl_terminator
+    mode tcp
+    server haproxy_ssl 127.0.0.1:${HAPROXY_INTERNAL_DECRYPT_PORT}
 EOF
-    echo -e "\n${C_GREEN}▶️ Reloading and starting HAProxy service...${C_RESET}"
-    systemctl daemon-reload
-    systemctl restart haproxy
-    sleep 2
-    if systemctl is-active --quiet haproxy; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: SSL Tunnel is active.${C_RESET}"
-        echo -e "Clients can now connect to this server's IP on port ${C_YELLOW}${ssl_port}${C_RESET} using an SSL/TLS tunnel."
-    else
-        echo -e "\n${C_RED}❌ ERROR: HAProxy service failed to start.${C_RESET}"
-        echo -e "${C_YELLOW}ℹ️ Displaying HAProxy status for diagnostics:${C_RESET}"
-        systemctl status haproxy --no-pager
+}
+
+save_edge_ports_info() {
+    cat > "$NGINX_PORTS_FILE" <<EOF
+EDGE_HTTP_PORT="${EDGE_PUBLIC_HTTP_PORT}"
+EDGE_TLS_PORT="${EDGE_PUBLIC_TLS_PORT}"
+HTTP_PORTS="${NGINX_INTERNAL_HTTP_PORT}"
+TLS_PORTS="${NGINX_INTERNAL_TLS_PORT}"
+EOF
+}
+
+configure_edge_stack() {
+    local server_name="$1"
+    [[ -z "$server_name" ]] && server_name="_"
+
+    backup_edge_configs
+
+    echo -e "\n${C_BLUE}📝 Writing internal Nginx config (127.0.0.1:${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT})...${C_RESET}"
+    write_internal_nginx_config "$server_name"
+
+    echo -e "${C_BLUE}📝 Writing HAProxy edge config (${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT})...${C_RESET}"
+    write_haproxy_edge_config
+
+    echo -e "\n${C_BLUE}🧪 Validating Nginx configuration...${C_RESET}"
+    if ! nginx -t >/dev/null 2>&1; then
+        echo -e "${C_RED}❌ Nginx configuration validation failed.${C_RESET}"
+        nginx -t
+        return 1
     fi
+
+    echo -e "${C_BLUE}🧪 Validating HAProxy configuration...${C_RESET}"
+    if ! haproxy -c -f "$HAPROXY_CONFIG" >/dev/null 2>&1; then
+        echo -e "${C_RED}❌ HAProxy configuration validation failed.${C_RESET}"
+        haproxy -c -f "$HAPROXY_CONFIG"
+        return 1
+    fi
+
+    systemctl daemon-reload
+    systemctl enable nginx >/dev/null 2>&1
+    systemctl enable haproxy >/dev/null 2>&1
+
+    echo -e "\n${C_BLUE}▶️ Restarting internal Nginx...${C_RESET}"
+    systemctl restart nginx || {
+        echo -e "${C_RED}❌ Nginx failed to restart.${C_RESET}"
+        systemctl status nginx --no-pager
+        return 1
+    }
+
+    echo -e "${C_BLUE}▶️ Restarting HAProxy edge...${C_RESET}"
+    systemctl restart haproxy || {
+        echo -e "${C_RED}❌ HAProxy failed to restart.${C_RESET}"
+        systemctl status haproxy --no-pager
+        return 1
+    }
+
+    sleep 2
+    if ! systemctl is-active --quiet nginx; then
+        echo -e "${C_RED}❌ Nginx is not active after restart.${C_RESET}"
+        systemctl status nginx --no-pager
+        return 1
+    fi
+    if ! systemctl is-active --quiet haproxy; then
+        echo -e "${C_RED}❌ HAProxy is not active after restart.${C_RESET}"
+        systemctl status haproxy --no-pager
+        return 1
+    fi
+
+    save_edge_ports_info
+    return 0
+}
+
+install_ssl_tunnel() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing HAProxy Edge Stack (80/443 -> 8880/8443) ---${C_RESET}"
+    echo -e "\n${C_CYAN}This installer will configure:${C_RESET}"
+    echo -e "   • HAProxy on ${C_WHITE}${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT}${C_RESET}"
+    echo -e "   • Internal Nginx on ${C_WHITE}${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}${C_RESET}"
+    echo -e "   • Loopback SSL decryptor on ${C_WHITE}${HAPROXY_INTERNAL_DECRYPT_PORT}${C_RESET}"
+
+    if [ -f "$HAPROXY_CONFIG" ] || [ -f "$NGINX_CONFIG_FILE" ]; then
+        echo -e "\n${C_YELLOW}⚠️ Existing HAProxy/Nginx configs will be replaced with the FirewallFalcon edge layout.${C_RESET}"
+        read -p "👉 Continue with the replacement? (y/n): " confirm_replace
+        if [[ "$confirm_replace" != "y" && "$confirm_replace" != "Y" ]]; then
+            echo -e "${C_RED}❌ Installation cancelled.${C_RESET}"
+            return
+        fi
+    fi
+
+    mkdir -p "$DB_DIR" "$SSL_CERT_DIR"
+
+    ensure_edge_stack_packages || return
+
+    systemctl stop haproxy >/dev/null 2>&1
+    systemctl stop nginx >/dev/null 2>&1
+    sleep 1
+
+    check_and_free_ports \
+        "$EDGE_PUBLIC_HTTP_PORT" \
+        "$EDGE_PUBLIC_TLS_PORT" \
+        "$NGINX_INTERNAL_HTTP_PORT" \
+        "$NGINX_INTERNAL_TLS_PORT" \
+        "$HAPROXY_INTERNAL_DECRYPT_PORT" || return
+
+    check_and_open_firewall_port "$EDGE_PUBLIC_HTTP_PORT" tcp || return
+    check_and_open_firewall_port "$EDGE_PUBLIC_TLS_PORT" tcp || return
+
+    select_edge_certificate || return
+
+    load_edge_cert_info
+    local server_name="${EDGE_DOMAIN:-$(detect_preferred_host)}"
+    [[ -z "$server_name" ]] && server_name="_"
+
+    configure_edge_stack "$server_name" || return
+
+    echo -e "\n${C_GREEN}✅ SUCCESS: HAProxy edge stack is active.${C_RESET}"
+    echo -e "   • Public edge ports: ${C_YELLOW}${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT}${C_RESET}"
+    echo -e "   • Internal Nginx ports: ${C_YELLOW}${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}${C_RESET}"
+    echo -e "   • Shared certificate: ${C_YELLOW}${EDGE_CERT_MODE:-unknown}${C_RESET}"
 }
 
 uninstall_ssl_tunnel() {
-    echo -e "\n${C_BOLD}${C_PURPLE}--- 🗑️ Uninstalling SSL Tunnel ---${C_RESET}"
+    echo -e "\n${C_BOLD}${C_PURPLE}--- 🗑️ Uninstalling HAProxy Edge Stack ---${C_RESET}"
     if ! command -v haproxy &> /dev/null; then
-        echo -e "${C_YELLOW}ℹ️ HAProxy not installed, skipping.${C_RESET}"
-        return
+        echo -e "${C_YELLOW}ℹ️ HAProxy is not installed, skipping service removal.${C_RESET}"
+    else
+        echo -e "${C_GREEN}🛑 Stopping and disabling HAProxy...${C_RESET}"
+        systemctl stop haproxy >/dev/null 2>&1
+        systemctl disable haproxy >/dev/null 2>&1
     fi
-    echo -e "${C_GREEN}🛑 Stopping HAProxy service...${C_RESET}"
-    systemctl stop haproxy >/dev/null 2>&1
+
     if [ -f "$HAPROXY_CONFIG" ]; then
-        echo -e "${C_GREEN}📝 Restoring default/empty HAProxy config...${C_RESET}"
-        cat > "$HAPROXY_CONFIG" <<-EOF
+        cat > "$HAPROXY_CONFIG" <<EOF
 global
-    log /dev/log    local0
-    log /dev/log    local1 notice
+    log /dev/log local0
+    log /dev/log local1 notice
+
 defaults
     log     global
 EOF
     fi
-    if [ -f "$SSL_CERT_FILE" ]; then
-        local delete_cert="y"
-        if [[ "$UNINSTALL_MODE" != "silent" ]]; then
-            read -p "👉 Delete the SSL certificate at $SSL_CERT_FILE? (y/n): " delete_cert
+
+    local delete_cert="n"
+    if [[ "$UNINSTALL_MODE" == "silent" ]]; then
+        delete_cert="y"
+    elif [ -f "$SSL_CERT_FILE" ] || [ -f "$SSL_CERT_CHAIN_FILE" ] || [ -f "$SSL_CERT_KEY_FILE" ]; then
+        if systemctl is-active --quiet nginx; then
+            echo -e "${C_YELLOW}⚠️ The shared certificate is also used by the internal Nginx proxy.${C_RESET}"
         fi
-        if [[ "$delete_cert" == "y" ]]; then
-            echo -e "${C_GREEN}🗑️ Removing SSL certificate...${C_RESET}"
-            rm -f "$SSL_CERT_FILE"
-        fi
+        read -p "👉 Delete the shared TLS certificate too? (y/n): " delete_cert
     fi
-    echo -e "${C_GREEN}✅ SSL Tunnel has been uninstalled.${C_RESET}"
+
+    if [[ "$delete_cert" == "y" || "$delete_cert" == "Y" ]]; then
+        if systemctl is-active --quiet nginx; then
+            echo -e "${C_GREEN}🛑 Stopping Nginx because the shared certificate is being removed...${C_RESET}"
+            systemctl stop nginx >/dev/null 2>&1
+        fi
+        rm -f "$SSL_CERT_FILE" "$SSL_CERT_CHAIN_FILE" "$SSL_CERT_KEY_FILE" "$EDGE_CERT_INFO_FILE"
+        rm -f "$NGINX_PORTS_FILE"
+        echo -e "${C_GREEN}🗑️ Shared certificate files removed.${C_RESET}"
+    fi
+
+    echo -e "${C_GREEN}✅ HAProxy edge stack has been removed.${C_RESET}"
+    if systemctl is-active --quiet nginx; then
+        echo -e "${C_DIM}The internal Nginx proxy is still installed on ${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}.${C_RESET}"
+    fi
 }
 
 show_dnstt_details() {
@@ -2189,19 +2709,25 @@ purge_nginx() {
     local mode="$1"
     if [[ "$mode" != "silent" ]]; then
         clear; show_banner
-        echo -e "${C_BOLD}${C_PURPLE}--- 🔥 Purge Nginx Installation ---${C_RESET}"
+        echo -e "${C_BOLD}${C_PURPLE}--- 🔥 Purge Internal Nginx Proxy ---${C_RESET}"
         if ! command -v nginx &> /dev/null; then
+            rm -f "$NGINX_PORTS_FILE"
             echo -e "\n${C_YELLOW}ℹ️ Nginx is not installed. Nothing to do.${C_RESET}"
             return
         fi
-        read -p "👉 This will COMPLETELY REMOVE Nginx and all its configuration files. Are you sure? (y/n): " confirm
-        if [[ "$confirm" != "y" ]]; then
+        echo -e "\n${C_YELLOW}⚠️ This removes the internal Nginx proxy on ${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}.${C_RESET}"
+        if systemctl is-active --quiet haproxy; then
+            echo -e "${C_YELLOW}⚠️ HAProxy will stay installed, but web payload routing from ${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT} will stop until you reinstall the stack.${C_RESET}"
+        fi
+        read -p "👉 Continue and purge Nginx? (y/n): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
             echo -e "\n${C_YELLOW}❌ Uninstallation cancelled.${C_RESET}"
             return
         fi
     fi
     echo -e "\n${C_BLUE}🛑 Stopping Nginx service...${C_RESET}"
     systemctl stop nginx >/dev/null 2>&1
+    systemctl disable nginx >/dev/null 2>&1
     echo -e "\n${C_BLUE}🗑️ Purging Nginx packages...${C_RESET}"
     apt-get purge -y nginx nginx-common >/dev/null 2>&1
     apt-get autoremove -y >/dev/null 2>&1
@@ -2212,263 +2738,143 @@ purge_nginx() {
     rm -f "${NGINX_CONFIG_FILE}.bak"
     rm -f "${NGINX_CONFIG_FILE}.bak.certbot"
     rm -f "${NGINX_CONFIG_FILE}.bak.selfsigned"
+    rm -f "${NGINX_CONFIG_FILE}.bak.firewallfalcon"
+    rm -f "$NGINX_PORTS_FILE"
     if [[ "$mode" != "silent" ]]; then
-        echo -e "\n${C_GREEN}✅ Nginx has been completely purged from the system.${C_RESET}"
+        echo -e "\n${C_GREEN}✅ Internal Nginx proxy purged. Shared FirewallFalcon certificates were kept.${C_RESET}"
     fi
 }
 
 install_nginx_proxy() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing Nginx Main Proxy (Ports 80 & 443) ---${C_RESET}"
-    if command -v nginx &> /dev/null; then
-        echo -e "\n${C_YELLOW}⚠️ An existing Nginx installation was found.${C_RESET}"
-        read -p "👉 To ensure a clean setup, the existing Nginx will be purged. Continue? (y/n): " confirm_purge
-        if [[ "$confirm_purge" != "y" ]]; then
-            echo -e "\n${C_RED}❌ Installation cancelled.${C_RESET}"
-            return
-        fi
-        purge_nginx "silent"
+    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Reconfiguring Internal Nginx Proxy (8880/8443) ---${C_RESET}"
+    echo -e "\n${C_CYAN}This keeps HAProxy on ${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT} and rewrites the internal Nginx proxy on ${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}.${C_RESET}"
+
+    if [ ! -s "$SSL_CERT_FILE" ] || [ ! -s "$SSL_CERT_CHAIN_FILE" ] || [ ! -s "$SSL_CERT_KEY_FILE" ]; then
+        echo -e "\n${C_YELLOW}⚠️ No shared FirewallFalcon certificate was found.${C_RESET}"
+        echo -e "${C_DIM}Running the full HAProxy edge installer so the certificate and both services stay aligned.${C_RESET}"
+        install_ssl_tunnel
+        return
     fi
-    echo -e "\n${C_BLUE}📦 Installing Nginx package...${C_RESET}"
-    apt-get update && apt-get install -y nginx || { echo -e "${C_RED}❌ Failed to install Nginx.${C_RESET}"; return; }
-    
-    check_and_free_ports "80" "443" || return
 
-    # --- Custom Port Selection ---
-    local tls_ports
-    read -p "👉 Enter TLS/SSL Port(s) [Default: 443]: " input_tls
-    if [[ -z "$input_tls" ]]; then tls_ports="443"; else tls_ports="$input_tls"; fi
+    mkdir -p "$DB_DIR" "$SSL_CERT_DIR"
+    ensure_edge_stack_packages || return
 
-    local http_ports
-    read -p "👉 Enter HTTP/Non-TLS Port(s) [Default: 80]: " input_http
-    if [[ -z "$input_http" ]]; then http_ports="80"; else http_ports="$input_http"; fi
+    systemctl stop haproxy >/dev/null 2>&1
+    systemctl stop nginx >/dev/null 2>&1
+    sleep 1
 
-    # Convert to arrays
-    read -a tls_ports_array <<< "$tls_ports"
-    read -a http_ports_array <<< "$http_ports"
-    
-    # Process Ports: Free and Open
-    for port in "${tls_ports_array[@]}" "${http_ports_array[@]}"; do
-        if ! [[ "$port" =~ ^[0-9]+$ ]]; then echo -e "${C_RED}❌ Invalid port: $port${C_RESET}"; return; fi
-        check_and_free_ports "$port" || return
-        check_and_open_firewall_port "$port" tcp || return
-    done
-    
-    echo -e "\n${C_GREEN}🔐 Generating self-signed SSL certificate for Nginx...${C_RESET}"
-    local SSL_CERT="/etc/ssl/certs/nginx-selfsigned.pem"
-    local SSL_KEY="/etc/ssl/private/nginx-selfsigned.key"
-    mkdir -p /etc/ssl/certs /etc/ssl/private
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "$SSL_KEY" \
-        -out "$SSL_CERT" \
-        -subj "/CN=firewallfalcon.proxy" >/dev/null 2>&1 || { echo -e "${C_RED}❌ Failed to generate SSL certificate.${C_RESET}"; return; }
-    echo -e "\n${C_GREEN}📝 Applying Nginx reverse proxy configuration...${C_RESET}"
-    mv "$NGINX_CONFIG_FILE" "${NGINX_CONFIG_FILE}.bak" 2>/dev/null
-    
-    # --- Generate Listen Directives ---
-    local listen_block=""
-    for port in "${http_ports_array[@]}"; do
-        listen_block="${listen_block}    listen $port;\n    listen [::]:$port;\n"
-    done
-    for port in "${tls_ports_array[@]}"; do
-        listen_block="${listen_block}    listen $port ssl http2;\n    listen [::]:$port ssl http2;\n"
-    done
+    check_and_free_ports \
+        "$EDGE_PUBLIC_HTTP_PORT" \
+        "$EDGE_PUBLIC_TLS_PORT" \
+        "$NGINX_INTERNAL_HTTP_PORT" \
+        "$NGINX_INTERNAL_TLS_PORT" \
+        "$HAPROXY_INTERNAL_DECRYPT_PORT" || return
 
-    cat > "$NGINX_CONFIG_FILE" <<EOF
-server {
-    server_tokens off;
-    server_name _;
-    
-$(echo -e "$listen_block")
+    check_and_open_firewall_port "$EDGE_PUBLIC_HTTP_PORT" tcp || return
+    check_and_open_firewall_port "$EDGE_PUBLIC_TLS_PORT" tcp || return
 
-    ssl_certificate /etc/ssl/certs/nginx-selfsigned.pem;
-    ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH!SSLv3:!EXP!PSK!DSS;
-    resolver 8.8.8.8;
-    
-    location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)$ {
-        client_max_body_size 0;
-        client_body_timeout 1d;
-        grpc_read_timeout 1d;
-        grpc_socket_keepalive on;
-        proxy_read_timeout 1d;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_socket_keepalive on;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        if (\$content_type ~* "GRPC") { grpc_pass grpc://127.0.0.1:\$fwdport\$is_args\$args; break; }
-        proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
-        break;
-    }
-    
-    location / {
-        proxy_read_timeout 3600s;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_http_version 1.1;
-        proxy_socket_keepalive on;
-        tcp_nodelay on;
-        tcp_nopush off;
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    }
-}
-EOF
-    echo -e "\n${C_GREEN}▶️ Restarting Nginx service...${C_RESET}"
-    systemctl restart nginx
-    sleep 2
-    if systemctl is-active --quiet nginx; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: Nginx Reverse Proxy is active.${C_RESET}"
-        echo -e "   - TLS Ports: ${C_YELLOW}${tls_ports}${C_RESET}"
-        echo -e "   - HTTP Ports: ${C_YELLOW}${http_ports}${C_RESET}"
-        
-        # Save ports for future reference
-        echo "TLS_PORTS=\"$tls_ports\"" > "$NGINX_PORTS_FILE"
-        echo "HTTP_PORTS=\"$http_ports\"" >> "$NGINX_PORTS_FILE"
-    else
-        echo -e "\n${C_RED}❌ ERROR: Nginx service failed to start.${C_RESET}"
-        echo -e "${C_YELLOW}ℹ️ Displaying Nginx status for diagnostics:${C_RESET}"
-        systemctl status nginx --no-pager
-        echo -e "${C_YELLOW}🔄 Restoring previous Nginx config...${C_RESET}"
-        mv "${NGINX_CONFIG_FILE}.bak" "$NGINX_CONFIG_FILE" 2>/dev/null
-    fi
-}
+    load_edge_cert_info
+    local server_name="${EDGE_DOMAIN:-$(detect_preferred_host)}"
+    [[ -z "$server_name" ]] && server_name="_"
 
-_install_certbot() {
-    if command -v certbot &> /dev/null; then
-        echo -e "${C_GREEN}✅ Certbot is already installed.${C_RESET}"
-        return 0
-    fi
-    echo -e "${C_YELLOW}⚠️ Certbot (for SSL) is not found.${C_RESET}"
-    read -p "👉 Do you want to install Certbot now? (y/n): " confirm_install
-    if [[ "$confirm_install" != "y" ]]; then
-        echo -e "${C_RED}❌ Installation skipped. Cannot proceed.${C_RESET}"
-        return 1
-    fi
-    echo -e "${C_BLUE}📦 Installing Certbot...${C_RESET}"
-    apt-get update > /dev/null 2>&1
-    apt-get install -y certbot || {
-        echo -e "${C_RED}❌ Failed to install Certbot.${C_RESET}"
-        return 1
-    }
-    echo -e "${C_GREEN}✅ Certbot installed successfully.${C_RESET}"
-    return 0
+    configure_edge_stack "$server_name" || return
+
+    echo -e "\n${C_GREEN}✅ Internal Nginx proxy reconfigured successfully.${C_RESET}"
+    echo -e "   • Public HAProxy edge: ${C_YELLOW}${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT}${C_RESET}"
+    echo -e "   • Internal Nginx: ${C_YELLOW}${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}${C_RESET}"
 }
 
 request_certbot_ssl() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🔒 Request Let's Encrypt SSL (Certbot) ---${C_RESET}"
-    if ! systemctl is-active --quiet nginx; then
-        echo -e "\n${C_RED}❌ Nginx is not running. Please ensure Nginx is installed and active.${C_RESET}"
-        return
+    echo -e "${C_BOLD}${C_PURPLE}--- 🔒 Shared Certbot Certificate (HAProxy + Nginx) ---${C_RESET}"
+    echo -e "\n${C_DIM}This will replace the shared certificate used by HAProxy on ${EDGE_PUBLIC_TLS_PORT} and internal Nginx on ${NGINX_INTERNAL_TLS_PORT}.${C_RESET}"
+
+    mkdir -p "$DB_DIR" "$SSL_CERT_DIR"
+    ensure_edge_stack_packages || return
+    load_edge_cert_info
+
+    local preferred_host
+    local default_domain=""
+    local domain_name
+    local email
+
+    preferred_host=$(detect_preferred_host)
+    if [[ -n "$EDGE_DOMAIN" ]] && ! _is_valid_ipv4 "$EDGE_DOMAIN"; then
+        default_domain="$EDGE_DOMAIN"
+    elif [[ -n "$preferred_host" ]] && ! _is_valid_ipv4 "$preferred_host"; then
+        default_domain="$preferred_host"
     fi
 
-    _install_certbot || return
-    
-    echo
-    read -p "👉 Enter your domain name (e.g., vps.example.com): " domain_name
-    if [[ -z "$domain_name" ]]; then
-        echo -e "\n${C_RED}❌ Domain name cannot be empty. Aborting.${C_RESET}"
-        return
-    fi
-    
-    read -p "👉 Enter your email address (for Let's Encrypt): " email
-    if [[ -z "$email" ]]; then
-        echo -e "\n${C_RED}❌ Email address cannot be empty. Aborting.${C_RESET}"
-        return
-    fi
-    
-    echo -e "\n${C_BLUE}🛑 Stopping Nginx temporarily for validation...${C_RESET}"
-    systemctl stop nginx
-    sleep 2
-
-    if ss -lntp | grep -q ":80\s"; then
-         echo -e "${C_RED}❌ Failed to free port 80, another process might be using it. Aborting.${C_RESET}"
-         systemctl start nginx
-         return
-    fi
-
-    echo -e "\n${C_BLUE}🚀 Requesting certificate for ${C_YELLOW}$domain_name...${C_RESET}"
-    certbot certonly --standalone -d "$domain_name" --non-interactive --agree-tos -m "$email"
-    
-    if [ $? -ne 0 ]; then
-        echo -e "\n${C_RED}❌ Certbot failed to obtain a certificate.${C_RESET}"
-        echo -e "${C_YELLOW}ℹ️ Please check your domain's DNS 'A' record points to this server's IP.${C_RESET}"
-        systemctl start nginx
-        return
-    fi
-
-    local SSL_CERT_LIVE="/etc/letsencrypt/live/$domain_name/fullchain.pem"
-    local SSL_KEY_LIVE="/etc/letsencrypt/live/$domain_name/privkey.pem"
-
-    if [ ! -f "$SSL_CERT_LIVE" ] || [ ! -f "$SSL_KEY_LIVE" ]; then
-        echo -e "\n${C_RED}❌ Certbot succeeded, but cert files not found at expected location.${C_RESET}"
-        systemctl start nginx
-        return
-    fi
-
-    echo -e "\n${C_GREEN}✅ Certificate obtained successfully!${C_RESET}"
-    echo -e "${C_BLUE}📝 Updating Nginx configuration...${C_RESET}"
-
-    cp "$NGINX_CONFIG_FILE" "${NGINX_CONFIG_FILE}.bak.selfsigned"
-    
-    sed -i "s|server_name _;|server_name $domain_name;|" "$NGINX_CONFIG_FILE"
-    sed -i "s|ssl_certificate /etc/ssl/certs/nginx-selfsigned.pem;|ssl_certificate $SSL_CERT_LIVE;|" "$NGINX_CONFIG_FILE"
-    sed -i "s|ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;|ssl_certificate_key $SSL_KEY_LIVE;|" "$NGINX_CONFIG_FILE"
-
-    echo -e "\n${C_BLUE}▶️ Restarting Nginx with new certificate...${C_RESET}"
-    systemctl start nginx
-    sleep 2
-    
-    if systemctl is-active --quiet nginx; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: Nginx is active with your new Let's Encrypt certificate!${C_RESET}"
+    if [[ -n "$default_domain" ]]; then
+        read -p "👉 Enter your domain name [$default_domain]: " domain_name
+        domain_name=${domain_name:-$default_domain}
     else
-        echo -e "\n${C_RED}❌ ERROR: Nginx failed to start with the new certificate.${C_RESET}"
-        echo -e "${C_YELLOW}🔄 Restoring self-signed certificate config...${C_RESET}"
-        mv "${NGINX_CONFIG_FILE}.bak.selfsigned" "$NGINX_CONFIG_FILE"
-        systemctl restart nginx
+        read -p "👉 Enter your domain name (e.g. vpn.example.com): " domain_name
     fi
+    if [[ -z "$domain_name" ]]; then
+        echo -e "\n${C_RED}❌ Domain name cannot be empty.${C_RESET}"
+        return
+    fi
+    if _is_valid_ipv4 "$domain_name"; then
+        echo -e "\n${C_RED}❌ Certbot requires a real domain name, not a raw IP address.${C_RESET}"
+        return
+    fi
+
+    read -p "👉 Enter your email for Let's Encrypt [${EDGE_EMAIL}]: " email
+    email=${email:-$EDGE_EMAIL}
+    if [[ -z "$email" ]]; then
+        echo -e "\n${C_RED}❌ Email address cannot be empty.${C_RESET}"
+        return
+    fi
+
+    check_and_open_firewall_port "$EDGE_PUBLIC_HTTP_PORT" tcp || return
+    check_and_open_firewall_port "$EDGE_PUBLIC_TLS_PORT" tcp || return
+
+    obtain_certbot_edge_cert "$domain_name" "$email" || return
+    configure_edge_stack "$domain_name" || return
+
+    echo -e "\n${C_GREEN}✅ Shared Certbot certificate applied successfully.${C_RESET}"
+    echo -e "   • Domain: ${C_YELLOW}${domain_name}${C_RESET}"
+    echo -e "   • Public edge: ${C_YELLOW}${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT}${C_RESET}"
 }
 
 nginx_proxy_menu() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🌐 Nginx Main Proxy Management ---${C_RESET}"
-    
-    local active_status="${C_STATUS_I}Inactive${C_RESET}"
+    echo -e "${C_BOLD}${C_PURPLE}--- 🌐 Internal Nginx Proxy Management ---${C_RESET}"
+
+    local nginx_status="${C_STATUS_I}Inactive${C_RESET}"
+    local haproxy_status="${C_STATUS_I}Inactive${C_RESET}"
     if systemctl is-active --quiet nginx; then
-        active_status="${C_STATUS_A}Active${C_RESET}"
+        nginx_status="${C_STATUS_A}Active${C_RESET}"
+    fi
+    if systemctl is-active --quiet haproxy; then
+        haproxy_status="${C_STATUS_A}Active${C_RESET}"
     fi
 
-    # Retrieve Ports Info
-    local ports_info=""
-    if [ -f "$NGINX_PORTS_FILE" ]; then
-        source "$NGINX_PORTS_FILE"
-        ports_info="\n    ${C_DIM}TLS: $TLS_PORTS | HTTP: $HTTP_PORTS${C_RESET}"
+    load_edge_cert_info
+    local cert_info="${EDGE_CERT_MODE:-Not configured}"
+    if [[ -n "$EDGE_DOMAIN" ]]; then
+        cert_info="${cert_info} - ${EDGE_DOMAIN}"
     fi
 
-    echo -e "\n${C_WHITE}Current Status: ${active_status}${ports_info}"
-    
+    echo -e "\n${C_WHITE}Nginx:${C_RESET} ${nginx_status}"
+    echo -e "${C_WHITE}HAProxy:${C_RESET} ${haproxy_status}"
+    echo -e "${C_DIM}Public Edge: ${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT} | Internal Nginx: ${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}${C_RESET}"
+    echo -e "${C_DIM}Shared Certificate: ${cert_info}${C_RESET}"
+
     echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
     
     if systemctl is-active --quiet nginx; then
          printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "🛑 Stop Nginx Service"
-         printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "🔄 Restart Nginx Service"
-         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Re-install/Re-configure (Change Ports)"
-         printf "  ${C_CHOICE}[ 4]${C_RESET} %-40s\n" "🔒 Request/Renew SSL (Certbot)"
+         printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "🔄 Restart HAProxy + Nginx Stack"
+         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Re-install/Re-configure Edge Stack"
+         printf "  ${C_CHOICE}[ 4]${C_RESET} %-40s\n" "🔒 Switch/Renew Shared SSL (Certbot)"
          printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Nginx"
     else
          printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "▶️ Start Nginx Service"
-         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Install/Configure Nginx"
+         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Install/Configure Edge Stack"
+         printf "  ${C_CHOICE}[ 4]${C_RESET} %-40s\n" "🔒 Switch/Renew Shared SSL (Certbot)"
          printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Nginx"
     fi
 
@@ -2482,16 +2888,34 @@ nginx_proxy_menu() {
                 echo -e "\n${C_BLUE}🛑 Stopping Nginx...${C_RESET}"
                 systemctl stop nginx
                 echo -e "${C_GREEN}✅ Nginx stopped.${C_RESET}"
+                if systemctl is-active --quiet haproxy; then
+                    echo -e "${C_YELLOW}⚠️ HAProxy is still running, but web traffic that depends on internal Nginx will not work until Nginx starts again.${C_RESET}"
+                fi
             else
                 echo -e "\n${C_BLUE}▶️ Starting Nginx...${C_RESET}"
                 systemctl start nginx
-                if systemctl is-active --quiet nginx; then echo -e "${C_GREEN}✅ Nginx Started.${C_RESET}"; else echo -e "${C_RED}❌ Failed to start.${C_RESET}"; fi
+                if systemctl is-active --quiet nginx; then
+                    echo -e "${C_GREEN}✅ Nginx started.${C_RESET}"
+                else
+                    echo -e "${C_RED}❌ Failed to start Nginx.${C_RESET}"
+                fi
             fi
             press_enter
             ;;
         2)
-            echo -e "\n${C_BLUE}🔄 Restarting Nginx...${C_RESET}"
-            systemctl restart nginx
+            echo -e "\n${C_BLUE}🔄 Restarting Nginx and HAProxy...${C_RESET}"
+            local restart_ok=true
+            systemctl restart nginx || restart_ok=false
+            if command -v haproxy &> /dev/null; then
+                systemctl restart haproxy || restart_ok=false
+            else
+                restart_ok=false
+            fi
+            if $restart_ok && systemctl is-active --quiet nginx && systemctl is-active --quiet haproxy; then
+                echo -e "${C_GREEN}✅ HAProxy + Nginx stack restarted.${C_RESET}"
+            else
+                echo -e "${C_RED}❌ One or more services failed to restart.${C_RESET}"
+            fi
             press_enter
             ;;
         3) 
@@ -2609,14 +3033,9 @@ protocol_menu() {
         local udp_custom_status; if systemctl is-active --quiet udp-custom; then udp_custom_status="${C_STATUS_A}(Active)${C_RESET}"; else udp_custom_status="${C_STATUS_I}(Inactive)${C_RESET}"; fi
         local zivpn_status; if systemctl is-active --quiet zivpn.service; then zivpn_status="${C_STATUS_A}(Active)${C_RESET}"; else zivpn_status="${C_STATUS_I}(Inactive)${C_RESET}"; fi
         
-        local ssl_tunnel_text="SSL Tunnel (Port 444)"
+        local ssl_tunnel_text="HAProxy Edge Stack (80/443)"
         local ssl_tunnel_status="${C_STATUS_I}(Inactive)${C_RESET}"
         if systemctl is-active --quiet haproxy; then
-            local active_port
-            active_port=$(grep -oP 'bind \*:(\d+)' "$HAPROXY_CONFIG" 2>/dev/null | awk -F: '{print $2}')
-            if [[ -n "$active_port" ]]; then
-                ssl_tunnel_text="SSL Tunnel (Port $active_port)"
-            fi
             ssl_tunnel_status="${C_STATUS_A}(Active)${C_RESET}"
         fi
         
@@ -2640,12 +3059,12 @@ protocol_menu() {
         printf "     ${C_CHOICE}[ 3]${C_RESET} %-45s %s\n" "🚀 Install udp-custom" "$udp_custom_status"
         printf "     ${C_CHOICE}[ 4]${C_RESET} %-45s\n" "🗑️ Uninstall udp-custom"
         printf "     ${C_CHOICE}[ 5]${C_RESET} %-45s %s\n" "🔒 Install ${ssl_tunnel_text}" "$ssl_tunnel_status"
-        printf "     ${C_CHOICE}[ 6]${C_RESET} %-45s\n" "🗑️ Uninstall SSL Tunnel"
+        printf "     ${C_CHOICE}[ 6]${C_RESET} %-45s\n" "🗑️ Uninstall HAProxy Edge Stack"
         printf "     ${C_CHOICE}[ 7]${C_RESET} %-45s %s\n" "📡 Install/View DNSTT (Port 53)" "$dnstt_status"
         printf "     ${C_CHOICE}[ 8]${C_RESET} %-45s\n" "🗑️ Uninstall DNSTT"
         printf "     ${C_CHOICE}[ 9]${C_RESET} %-45s %s\n" "🦅 Install Falcon Proxy (Select Version)" "$falconproxy_status"
         printf "     ${C_CHOICE}[10]${C_RESET} %-45s\n" "🗑️ Uninstall Falcon Proxy"
-        printf "     ${C_CHOICE}[11]${C_RESET} %-45s %s\n" "🌐 Install/Manage Nginx Proxy (80/443)" "$nginx_status"
+        printf "     ${C_CHOICE}[11]${C_RESET} %-45s %s\n" "🌐 Install/Manage Internal Nginx (8880/8443)" "$nginx_status"
         printf "     ${C_CHOICE}[16]${C_RESET} %-45s %s\n" "🛡️ Install ZiVPN (UDP 5667)" "$zivpn_status"
         printf "     ${C_CHOICE}[17]${C_RESET} %-45s\n" "🗑️ Uninstall ZiVPN"
         
@@ -2681,7 +3100,7 @@ uninstall_script() {
     echo -e " - The main command ($(command -v menu))"
     echo -e " - All configuration and user data ($DB_DIR)"
     echo -e " - The active limiter service ($LIMITER_SERVICE)"
-    echo -e " - All installed services (badvpn, udp-custom, SSL Tunnel, Nginx, DNSTT)"
+    echo -e " - All installed services (badvpn, udp-custom, HAProxy Edge Stack, Nginx, DNSTT)"
     echo -e "\n${C_RED}This action is irreversible.${C_RESET}"
     echo ""
     read -p "👉 Type 'yes' to confirm and proceed with uninstallation: " confirm
@@ -2985,18 +3404,10 @@ generate_client_config() {
     local user=$1
     local pass=$2
     
-    # Auto-detect Host
     local host_ip=$(curl -s -4 icanhazip.com)
-    local host_domain="$host_ip"
-    if [ -f "$DNS_INFO_FILE" ]; then
-        local managed_domain=$(grep 'FULL_DOMAIN' "$DNS_INFO_FILE" | cut -d'"' -f2)
-        if [[ -n "$managed_domain" ]]; then host_domain="$managed_domain"; fi
-    fi
-    # Also check if Nginx Certbot is used
-    if [ -f "$NGINX_CONFIG_FILE" ]; then
-        local nginx_domain=$(grep -oP 'server_name \K[^\s;]+' "$NGINX_CONFIG_FILE" | head -n 1)
-        if [[ "$nginx_domain" != "_" && -n "$nginx_domain" ]]; then host_domain="$nginx_domain"; fi
-    fi
+    local host_domain
+    host_domain=$(detect_preferred_host)
+    [[ -z "$host_domain" ]] && host_domain="$host_ip"
 
     echo -e "\n${C_BOLD}${C_PURPLE}--- 📱 Client Connection Configuration ---${C_RESET}"
     echo -e "${C_CYAN}Copy the details below to your clipboard:${C_RESET}\n"
@@ -3014,31 +3425,18 @@ generate_client_config() {
     echo -e "   • Port: 22"
     echo -e "   • payload: (Standard SSH)"
 
-    # 2. SSL/TLS Tunnel (HAProxy or Nginx)
-    local ssl_port=""
-    local ssl_type=""
-    
-    # Check HAProxy
+    # 2. HAProxy edge stack
     if systemctl is-active --quiet haproxy; then
-        local haproxy_port=$(grep -oP 'bind \*:(\d+)' "$HAPROXY_CONFIG" 2>/dev/null | awk -F: '{print $2}')
-        if [[ -n "$haproxy_port" ]]; then ssl_port="$haproxy_port"; ssl_type="HAProxy"; fi
-    fi
-    # Check Nginx (Override if both exist, or show both)
-    if systemctl is-active --quiet nginx && [ -f "$NGINX_PORTS_FILE" ]; then
-         source "$NGINX_PORTS_FILE"
-         # Take the first TLS port
-         local nginx_ssl_port=$(echo "$TLS_PORTS" | awk '{print $1}')
-         if [[ -n "$nginx_ssl_port" ]]; then 
-            if [[ -n "$ssl_port" ]]; then ssl_port="$ssl_port, $nginx_ssl_port"; else ssl_port="$nginx_ssl_port"; fi
-            ssl_type="Nginx/TLS"
-         fi
-    fi
-    
-    if [[ -n "$ssl_port" ]]; then
-        echo -e "\n🔹 ${C_BOLD}SSL/TLS Tunnel ($ssl_type)${C_RESET}:"
+        echo -e "\n🔹 ${C_BOLD}HAProxy Edge Stack${C_RESET}:"
         echo -e "   • Host: $host_domain"
-        echo -e "   • Port(s): $ssl_port"
+        echo -e "   • Port 80: HTTP payloads / raw SSH"
+        echo -e "   • Port 443: TLS / SNI / SSL payloads"
+        echo -e "   • Internal handoff: Nginx ${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}"
         echo -e "   • SNI (BugHost): $host_domain (or your preferred SNI)"
+    elif systemctl is-active --quiet nginx; then
+        echo -e "\n🔹 ${C_BOLD}Internal Nginx Proxy${C_RESET}:"
+        echo -e "   • Internal only: ${NGINX_INTERNAL_HTTP_PORT}/${NGINX_INTERNAL_TLS_PORT}"
+        echo -e "   • Public clients should connect through HAProxy on ${EDGE_PUBLIC_HTTP_PORT}/${EDGE_PUBLIC_TLS_PORT}"
     fi
 
     # 3. UDP Custom
