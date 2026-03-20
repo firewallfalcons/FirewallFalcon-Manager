@@ -77,7 +77,7 @@ DESEC_DOMAIN="manager.firewallfalcon.qzz.io"
 
 SELECTED_USER=""
 UNINSTALL_MODE="interactive"
-BANNER_CACHE_TTL=5
+BANNER_CACHE_TTL=15
 BANNER_CACHE_TS=0
 BANNER_CACHE_OS_NAME=""
 BANNER_CACHE_UP_TIME=""
@@ -85,6 +85,12 @@ BANNER_CACHE_RAM_USAGE=""
 BANNER_CACHE_CPU_LOAD=""
 BANNER_CACHE_ONLINE_USERS=0
 BANNER_CACHE_TOTAL_USERS=0
+SSH_SESSION_CACHE_TTL=10
+SSH_SESSION_CACHE_TS=0
+SSH_SESSION_CACHE_DB_MTIME=0
+SSH_SESSION_TOTAL=0
+declare -A SSH_SESSION_COUNTS=()
+declare -A SSH_SESSION_PIDS=()
 
 if [[ $EUID -ne 0 ]]; then
    echo -e "${C_RED}❌ Error: This script requires root privileges to run.${C_RESET}"
@@ -108,6 +114,13 @@ check_environment() {
 ensure_firewallfalcon_dirs() {
     mkdir -p "$DB_DIR" "$SSL_CERT_DIR" "$BANDWIDTH_DIR" "/etc/firewallfalcon/banners" /etc/ssh/sshd_config.d
     touch "$DB_FILE"
+}
+
+require_interactive_terminal() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo -e "${C_RED}❌ Error: The FirewallFalcon menu must be run from an interactive terminal.${C_RESET}"
+        exit 1
+    fi
 }
 
 initial_setup() {
@@ -237,192 +250,220 @@ setup_limiter_service() {
     # Combined limiter + bandwidth monitoring
     cat > "$LIMITER_SCRIPT" << 'EOF'
 #!/bin/bash
+# FirewallFalcon limiter version 2026-03-20.1
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 PID_DIR="$BW_DIR/pidtrack"
+BANNER_DIR="/etc/firewallfalcon/banners"
+SCAN_INTERVAL=30
 
 mkdir -p "$BW_DIR" "$PID_DIR"
+shopt -s nullglob
+
+write_banner_if_changed() {
+    local user="$1"
+    local content="$2"
+    local banner_file="$BANNER_DIR/${user}.txt"
+    local tmp_file="${banner_file}.tmp"
+
+    printf "%s" "$content" > "$tmp_file"
+    if ! cmp -s "$tmp_file" "$banner_file" 2>/dev/null; then
+        mv "$tmp_file" "$banner_file"
+    else
+        rm -f "$tmp_file"
+    fi
+}
 
 while true; do
-    if [[ ! -f "$DB_FILE" ]]; then
-        sleep 30
+    if [[ ! -s "$DB_FILE" ]]; then
+        sleep "$SCAN_INTERVAL"
         continue
     fi
-    
+
     current_ts=$(date +%s)
-    
+    banners_enabled=false
+    declare -A session_counts=()
+    declare -A session_pids=()
+    declare -A locked_users=()
+    declare -A uid_to_user=()
+    declare -A seen_sessions=()
+
+    while IFS=: read -r username _ uid _rest; do
+        [[ -n "$username" && "$uid" =~ ^[0-9]+$ ]] && uid_to_user["$uid"]="$username"
+    done < /etc/passwd
+
+    while read -r ssh_pid ssh_owner; do
+        [[ "$ssh_pid" =~ ^[0-9]+$ ]] || continue
+
+        session_user=""
+        if [[ -n "$ssh_owner" && "$ssh_owner" != "root" && "$ssh_owner" != "sshd" ]]; then
+            session_user="$ssh_owner"
+        elif [[ -r "/proc/$ssh_pid/loginuid" ]]; then
+            login_uid=""
+            read -r login_uid < "/proc/$ssh_pid/loginuid" || login_uid=""
+            if [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" != "4294967295" ]]; then
+                session_user="${uid_to_user[$login_uid]}"
+            fi
+        fi
+
+        [[ -n "$session_user" ]] || continue
+        session_key="${session_user}:$ssh_pid"
+        [[ -z "${seen_sessions[$session_key]+x}" ]] || continue
+
+        seen_sessions["$session_key"]=1
+        ((session_counts["$session_user"]++))
+        session_pids["$session_user"]+="$ssh_pid "
+    done < <(ps -C sshd -o pid=,user= 2>/dev/null)
+
+    while read -r passwd_user _ passwd_status _rest; do
+        [[ "$passwd_status" == "L" ]] && locked_users["$passwd_user"]=1
+    done < <(passwd -Sa 2>/dev/null)
+
+    if [[ -f "/etc/firewallfalcon/banners_enabled" ]]; then
+        mkdir -p "$BANNER_DIR"
+        banners_enabled=true
+    fi
+
     while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
         [[ -z "$user" || "$user" == \#* ]] && continue
-        
-        # --- Expiry Check ---
-        if [[ "$expiry" != "Never" && "$expiry" != "" ]]; then
-             expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
-             if [[ $expiry_ts -lt $current_ts && $expiry_ts -ne 0 ]]; then
-                if ! passwd -S "$user" | grep -q " L "; then
+
+        online_count=${session_counts["$user"]:-0}
+        user_locked=false
+        if [[ -n "${locked_users[$user]+x}" ]]; then
+            user_locked=true
+        fi
+
+        expiry_ts=0
+        if [[ "$expiry" != "Never" && -n "$expiry" ]]; then
+            expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+            if [[ "$expiry_ts" =~ ^[0-9]+$ ]] && (( expiry_ts > 0 && expiry_ts < current_ts )); then
+                if ! $user_locked; then
                     usermod -L "$user" &>/dev/null
                     killall -u "$user" -9 &>/dev/null
+                    locked_users["$user"]=1
                 fi
                 continue
-             fi
+            fi
         fi
-        
-        # --- Connection Limit Check ---
-        online_count=$(pgrep -c -u "$user" sshd)
-        if ! [[ "$limit" =~ ^[0-9]+$ ]]; then limit=1; fi
-        
-        if [[ "$online_count" -gt "$limit" ]]; then
-            if ! passwd -S "$user" | grep -q " L "; then
+
+        [[ "$limit" =~ ^[0-9]+$ ]] || limit=1
+        if (( online_count > limit )); then
+            if ! $user_locked; then
                 usermod -L "$user" &>/dev/null
                 killall -u "$user" -9 &>/dev/null
-                (sleep 120; usermod -U "$user" &>/dev/null) & 
+                (sleep 120; usermod -U "$user" &>/dev/null) &
+                locked_users["$user"]=1
+                user_locked=true
             else
                 killall -u "$user" -9 &>/dev/null
             fi
         fi
-        
-        # --- SSH Banner Generation (Delay of 1 cycle for BW stats is fine) ---
-        if [[ -f "/etc/firewallfalcon/banners_enabled" ]]; then
-            mkdir -p "/etc/firewallfalcon/banners"
+
+        if $banners_enabled; then
             days_left="N/A"
-            if [[ "$expiry" != "Never" && -n "$expiry" ]]; then
-                if [[ $expiry_ts -gt 0 ]]; then
-                    diff_secs=$((expiry_ts - current_ts))
-                    if [[ $diff_secs -le 0 ]]; then
-                        days_left="EXPIRED"
+            if [[ "$expiry" != "Never" && -n "$expiry" && "$expiry_ts" =~ ^[0-9]+$ && $expiry_ts -gt 0 ]]; then
+                diff_secs=$((expiry_ts - current_ts))
+                if (( diff_secs <= 0 )); then
+                    days_left="EXPIRED"
+                else
+                    d_l=$(( diff_secs / 86400 ))
+                    h_l=$(( (diff_secs % 86400) / 3600 ))
+                    if (( d_l == 0 )); then
+                        days_left="${h_l}h left"
                     else
-                        d_l=$(( diff_secs / 86400 ))
-                        h_l=$(( (diff_secs % 86400) / 3600 ))
-                        if [[ $d_l -eq 0 ]]; then days_left="${h_l}h left"
-                        else days_left="${d_l}d ${h_l}h"; fi
+                        days_left="${d_l}d ${h_l}h"
                     fi
                 fi
             fi
-            
+
             bw_info="Unlimited"
             if [[ "$bandwidth_gb" != "0" && -n "$bandwidth_gb" ]]; then
                 usagefile="$BW_DIR/${user}.usage"
                 accum_disp=0
-                [[ -f "$usagefile" ]] && accum_disp=$(cat "$usagefile" 2>/dev/null)
+                if [[ -f "$usagefile" ]]; then
+                    read -r accum_disp < "$usagefile"
+                    [[ "$accum_disp" =~ ^[0-9]+$ ]] || accum_disp=0
+                fi
                 used_gb=$(awk "BEGIN {printf \"%.2f\", $accum_disp / 1073741824}")
                 remain_gb=$(awk "BEGIN {r=$bandwidth_gb - $used_gb; if(r<0) r=0; printf \"%.2f\", r}")
                 bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
             fi
-            
-            # Format the output with HTML tags since clients like HTTP Custom render Server Messages using Html.fromHtml()
-            # Crucial: Use echo -e instead of heredoc to prevent DOS CRLF syntax errors when moving script to Linux
-            echo -e "<br><font color=\"yellow\"><b>      ✨ ACCOUNT STATUS ✨      </b></font><br><br>" > "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "<font color=\"white\">👤 <b>Username   :</b> $user</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "<font color=\"white\">📊 <b>Bandwidth  :</b> $bw_info</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
-            echo -e "<font color=\"white\">🔌 <b>Sessions   :</b> $online_count/$limit</font><br><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
+
+            banner_content="<br><font color=\"yellow\"><b>      ✨ ACCOUNT STATUS ✨      </b></font><br><br>"
+            banner_content+="<font color=\"white\">👤 <b>Username   :</b> $user</font><br>"
+            banner_content+="<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>"
+            banner_content+="<font color=\"white\">📊 <b>Bandwidth  :</b> $bw_info</font><br>"
+            banner_content+="<font color=\"white\">🔌 <b>Sessions   :</b> $online_count/$limit</font><br><br>"
+            write_banner_if_changed "$user" "$banner_content"
         fi
 
-        
-        # --- Bandwidth Check ---
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
-        
-        # Get user UID
-        user_uid=$(id -u "$user" 2>/dev/null)
-        [[ -z "$user_uid" ]] && continue
-        
-        # Find sshd PIDs for this user via loginuid
-        pids=""
-        
-        # Method 1: pgrep
-        m1=$(pgrep -u "$user" sshd 2>/dev/null | tr '\n' ' ')
-        pids="$m1"
-        
-        # Method 2: loginuid scan
-        for p in /proc/[0-9]*/loginuid; do
-            [[ ! -f "$p" ]] && continue
-            luid=$(cat "$p" 2>/dev/null)
-            [[ -z "$luid" || "$luid" == "4294967295" ]] && continue
-            [[ "$luid" != "$user_uid" ]] && continue
-            
-            pid_dir=$(dirname "$p")
-            pid_num=$(basename "$pid_dir")
-            
-            cname=$(cat "$pid_dir/comm" 2>/dev/null)
-            [[ "$cname" != "sshd" ]] && continue
-            
-            ppid_val=$(awk '/^PPid:/{print $2}' "$pid_dir/status" 2>/dev/null)
-            [[ "$ppid_val" == "1" ]] && continue
-            
-            pids="$pids $pid_num"
-        done
-        
-        # Deduplicate
-        pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
-        
-        # Read accumulated usage
+
         usagefile="$BW_DIR/${user}.usage"
         accumulated=0
         if [[ -f "$usagefile" ]]; then
-            accumulated=$(cat "$usagefile" 2>/dev/null)
-            if ! [[ "$accumulated" =~ ^[0-9]+$ ]]; then accumulated=0; fi
+            read -r accumulated < "$usagefile"
+            [[ "$accumulated" =~ ^[0-9]+$ ]] || accumulated=0
         fi
-        
+
+        pids="${session_pids["$user"]}"
         if [[ -z "$pids" ]]; then
             rm -f "$PID_DIR/${user}__"*.last 2>/dev/null
             continue
         fi
-        
+
         delta_total=0
-        
         for pid in $pids; do
-            [[ -z "$pid" ]] && continue
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
             io_file="/proc/$pid/io"
+            cur=0
             if [[ -r "$io_file" ]]; then
-                rchar=$(awk '/^rchar:/{print $2}' "$io_file" 2>/dev/null)
-                wchar=$(awk '/^wchar:/{print $2}' "$io_file" 2>/dev/null)
-                [[ -z "$rchar" ]] && rchar=0
-                [[ -z "$wchar" ]] && wchar=0
+                rchar=0
+                wchar=0
+                while read -r key value; do
+                    case "$key" in
+                        rchar:) rchar=${value:-0} ;;
+                        wchar:) wchar=${value:-0} ;;
+                    esac
+                done < "$io_file"
                 cur=$((rchar + wchar))
-            else
-                cur=0
             fi
-            
+
             pidfile="$PID_DIR/${user}__${pid}.last"
-            
             if [[ -f "$pidfile" ]]; then
-                prev=$(cat "$pidfile" 2>/dev/null)
-                if ! [[ "$prev" =~ ^[0-9]+$ ]]; then prev=0; fi
-                
-                if [[ "$cur" -ge "$prev" ]]; then
+                read -r prev < "$pidfile"
+                [[ "$prev" =~ ^[0-9]+$ ]] || prev=0
+                if (( cur >= prev )); then
                     d=$((cur - prev))
                 else
                     d=$cur
                 fi
                 delta_total=$((delta_total + d))
             fi
-            echo "$cur" > "$pidfile"
+            printf "%s\n" "$cur" > "$pidfile"
         done
-        
-        # Clean up dead PID files
+
         for f in "$PID_DIR/${user}__"*.last; do
-            [[ ! -f "$f" ]] && continue
-            fpid=$(basename "$f" .last)
-            fpid=${fpid#${user}__}
-            [[ ! -d "/proc/$fpid" ]] && rm -f "$f"
+            [[ -f "$f" ]] || continue
+            fpid=${f##*__}
+            fpid=${fpid%.last}
+            [[ -d "/proc/$fpid" ]] || rm -f "$f"
         done
-        
-        # Update total
+
         new_total=$((accumulated + delta_total))
-        echo "$new_total" > "$usagefile"
-        
-        # Check quota
+        printf "%s\n" "$new_total" > "$usagefile"
+
         quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
-        
-        if [[ "$new_total" -ge "$quota_bytes" ]]; then
-            if ! passwd -S "$user" 2>/dev/null | grep -q " L "; then
+        if [[ "$quota_bytes" =~ ^[0-9]+$ ]] && (( new_total >= quota_bytes )); then
+            if ! $user_locked; then
                 usermod -L "$user" &>/dev/null
                 killall -u "$user" -9 &>/dev/null
+                locked_users["$user"]=1
             fi
         fi
-        
     done < "$DB_FILE"
-    
-    sleep 15
+
+    sleep "$SCAN_INTERVAL"
 done
 EOF
     chmod +x "$LIMITER_SCRIPT"
@@ -438,7 +479,10 @@ After=network.target
 Type=simple
 ExecStart=$LIMITER_SCRIPT
 Restart=always
-RestartSec=5
+RestartSec=10
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=multi-user.target
@@ -455,6 +499,13 @@ EOF
     else
         systemctl restart firewallfalcon-limiter --no-block &>/dev/null
         
+    fi
+}
+
+sync_runtime_components_if_needed() {
+    local limiter_marker="# FirewallFalcon limiter version 2026-03-20.1"
+    if [[ ! -f "$LIMITER_SCRIPT" ]] || ! grep -Fqx "$limiter_marker" "$LIMITER_SCRIPT" 2>/dev/null; then
+        setup_limiter_service >/dev/null 2>&1
     fi
 }
 
@@ -695,7 +746,11 @@ _select_user_interface() {
     echo
     local choice
     while true; do
-        read -p "👉 Enter the number or exact username: " choice
+        if ! read -r -p "👉 Enter the number or exact username: " choice; then
+            echo
+            SELECTED_USER=""
+            return
+        fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 0 ] && [ "$choice" -le "${#users[@]}" ]; then
             if [ "$choice" -eq 0 ]; then
                 SELECTED_USER=""; return
@@ -753,7 +808,11 @@ _select_multi_user_interface() {
     echo
     local choice
     while true; do
-        read -p "👉 Enter user numbers or usernames: " choice
+        if ! read -r -p "👉 Enter user numbers or usernames: " choice; then
+            echo
+            SELECTED_USERS=()
+            return
+        fi
         choice=$(echo "$choice" | tr ',' ' ') # Replace commas with spaces
         
         if [[ -z "$choice" ]]; then
@@ -970,7 +1029,12 @@ edit_user() {
         printf "  ${C_GREEN}[ 3]${C_RESET} %-35s\n" "📶 Change Connection Limit"
         printf "  ${C_GREEN}[ 4]${C_RESET} %-35s\n" "📦 Change Bandwidth Limit"
         printf "  ${C_GREEN}[ 5]${C_RESET} %-35s\n" "🔄 Reset Bandwidth Counter"
-        echo -e "\n  ${C_RED}[ 0]${C_RESET} ✅ Finish Editing"; echo; read -p "👉 Enter your choice: " edit_choice
+        echo -e "\n  ${C_RED}[ 0]${C_RESET} ✅ Finish Editing"
+        echo
+        if ! read -r -p "👉 Enter your choice: " edit_choice; then
+            echo
+            return
+        fi
         case $edit_choice in
             1)
                local new_pass=""
@@ -1017,7 +1081,7 @@ edit_user() {
             0) return ;;
             *) echo -e "\n${C_RED}❌ Invalid option.${C_RESET}" ;;
         esac
-        echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to continue editing..." && read -r
+        echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to continue editing..." && read -r || return
     done
 }
 
@@ -1077,7 +1141,6 @@ list_users() {
     current_ts=$(date +%s)
     local -A system_user_lookup=()
     local -A locked_user_lookup=()
-    local -A session_counts=()
 
     while IFS=: read -r system_user _rest; do
         [[ -n "$system_user" ]] && system_user_lookup["$system_user"]=1
@@ -1089,13 +1152,10 @@ list_users() {
             locked_user_lookup["$passwd_user"]=1
         fi
     done < <(passwd -Sa 2>/dev/null)
-
-    while read -r ssh_user ssh_count; do
-        [[ -n "$ssh_user" && -n "$ssh_count" ]] && session_counts["$ssh_user"]="$ssh_count"
-    done < <(ps -C sshd -o user= 2>/dev/null | awk 'NF {count[$1]++} END {for (user in count) print user, count[user]}')
+    refresh_ssh_session_cache
 
     while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
-        local online_count="${session_counts[$user]:-0}"
+        local online_count="${SSH_SESSION_COUNTS[$user]:-0}"
         local connection_string="$online_count / $limit"
         local plain_status="Active"
         local status="${C_GREEN}🟢 Active${C_RESET}"
@@ -2513,7 +2573,10 @@ install_falcon_proxy() {
     
     local choice
     while true; do
-        read -p "👉 Enter version number [1]: " choice
+        if ! read -r -p "👉 Enter version number [1]: " choice; then
+            echo
+            return
+        fi
         choice=${choice:-1}
         if [[ "$choice" == "0" ]]; then return; fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -le "${#versions[@]}" ]; then
@@ -3080,20 +3143,72 @@ uninstall_xui_panel() {
     fi
 }
 
-count_managed_online_sessions() {
-    if [[ ! -s "$DB_FILE" ]]; then
-        echo 0
+refresh_ssh_session_cache() {
+    local now db_mtime
+    now=$(date +%s)
+    db_mtime=$(stat -c %Y "$DB_FILE" 2>/dev/null || echo 0)
+
+    if (( SSH_SESSION_CACHE_TS > 0 && now - SSH_SESSION_CACHE_TS < SSH_SESSION_CACHE_TTL && db_mtime == SSH_SESSION_CACHE_DB_MTIME )); then
         return
     fi
 
-    local session_count
-    session_count=$(awk -F: 'NR==FNR { users[$1]=1; next } ($1 in users) { count++ } END { print count+0 }' "$DB_FILE" <(ps -C sshd -o user= 2>/dev/null))
-    [[ "$session_count" =~ ^[0-9]+$ ]] || session_count=0
-    echo "$session_count"
+    SSH_SESSION_COUNTS=()
+    SSH_SESSION_PIDS=()
+    SSH_SESSION_TOTAL=0
+    SSH_SESSION_CACHE_DB_MTIME=$db_mtime
+
+    if [[ ! -s "$DB_FILE" ]]; then
+        SSH_SESSION_CACHE_TS=$now
+        return
+    fi
+
+    local -A managed_user_lookup=()
+    local -A uid_user_lookup=()
+    local -A seen_sessions=()
+    local managed_user system_user system_uid ssh_pid ssh_owner candidate_user login_uid
+
+    while IFS=: read -r managed_user _rest; do
+        [[ -n "$managed_user" && "$managed_user" != \#* ]] && managed_user_lookup["$managed_user"]=1
+    done < "$DB_FILE"
+
+    while IFS=: read -r system_user _ system_uid _rest; do
+        [[ -n "$system_user" && "$system_uid" =~ ^[0-9]+$ ]] && uid_user_lookup["$system_uid"]="$system_user"
+    done < /etc/passwd
+
+    while read -r ssh_pid ssh_owner; do
+        [[ "$ssh_pid" =~ ^[0-9]+$ ]] || continue
+
+        candidate_user=""
+        if [[ -n "$ssh_owner" && "$ssh_owner" != "root" && "$ssh_owner" != "sshd" && -n "${managed_user_lookup[$ssh_owner]+x}" ]]; then
+            candidate_user="$ssh_owner"
+        elif [[ -r "/proc/$ssh_pid/loginuid" ]]; then
+            login_uid=""
+            read -r login_uid < "/proc/$ssh_pid/loginuid" || login_uid=""
+            if [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" != "4294967295" ]]; then
+                candidate_user="${uid_user_lookup[$login_uid]}"
+            fi
+        fi
+
+        [[ -n "$candidate_user" && -n "${managed_user_lookup[$candidate_user]+x}" ]] || continue
+        [[ -z "${seen_sessions[$candidate_user:$ssh_pid]+x}" ]] || continue
+
+        seen_sessions["$candidate_user:$ssh_pid"]=1
+        ((SSH_SESSION_COUNTS["$candidate_user"]++))
+        SSH_SESSION_PIDS["$candidate_user"]+="$ssh_pid "
+        ((SSH_SESSION_TOTAL++))
+    done < <(ps -C sshd -o pid=,user= 2>/dev/null)
+
+    SSH_SESSION_CACHE_TS=$now
+}
+
+count_managed_online_sessions() {
+    refresh_ssh_session_cache
+    echo "$SSH_SESSION_TOTAL"
 }
 
 invalidate_banner_cache() {
     BANNER_CACHE_TS=0
+    SSH_SESSION_CACHE_TS=0
 }
 
 refresh_banner_cache() {
@@ -3103,7 +3218,9 @@ refresh_banner_cache() {
         return
     fi
 
-    BANNER_CACHE_OS_NAME=$(grep -oP 'PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "Linux")
+    if [[ -z "$BANNER_CACHE_OS_NAME" ]]; then
+        BANNER_CACHE_OS_NAME=$(grep -oP 'PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "Linux")
+    fi
     BANNER_CACHE_UP_TIME=$(uptime -p 2>/dev/null | sed 's/up //' || echo "unknown")
     BANNER_CACHE_RAM_USAGE=$(free -m | awk '/^Mem:/{if($2>0){printf "%.2f", $3*100/$2}else{print "0.00"}}')
     BANNER_CACHE_CPU_LOAD=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
@@ -3118,7 +3235,7 @@ refresh_banner_cache() {
 
 show_banner() {
     refresh_banner_cache
-    clear
+    [[ -t 1 ]] && clear
     echo
     echo -e "${C_TITLE}   FirewallFalcon Manager ${C_RESET}${C_DIM}| v4.0.0 Premium Edition${C_RESET}"
     echo -e "${C_BLUE}   ─────────────────────────────────────────────────────────${C_RESET}"
@@ -3177,7 +3294,10 @@ protocol_menu() {
         echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
         echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
         echo
-        read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
+        if ! read -r -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice; then
+            echo
+            return
+        fi
         case $choice in
             1) install_badvpn; press_enter ;; 2) uninstall_badvpn; press_enter ;;
             3) install_udp_custom; press_enter ;; 4) uninstall_udp_custom; press_enter ;;
@@ -3583,42 +3703,61 @@ client_config_menu() {
     generate_client_config "$u" "$pass"
 }
 
+format_rate_from_kbps() {
+    local kbps=${1:-0}
+    if (( kbps >= 1024 )); then
+        printf "%d.%02d MB/s" $((kbps / 1024)) $((((kbps % 1024) * 100) / 1024))
+    else
+        printf "%d KB/s" "$kbps"
+    fi
+}
+
 # Lightweight Bash Monitor (No vnStat required)
 simple_live_monitor() {
     local iface=$1
+    local rx_file="/sys/class/net/$iface/statistics/rx_bytes"
+    local tx_file="/sys/class/net/$iface/statistics/tx_bytes"
+    local interval=2
+    local stop_monitor=0
+    local rx1 tx1 rx2 tx2 rx_diff tx_diff rx_kbs tx_kbs rx_fmt tx_fmt
+
+    if [[ -z "$iface" || ! -r "$rx_file" || ! -r "$tx_file" ]]; then
+        echo -e "\n${C_RED}❌ Could not read interface statistics for '${iface:-unknown}'.${C_RESET}"
+        return
+    fi
+
     echo -e "\n${C_BLUE}⚡ Starting Lightweight Traffic Monitor for $iface...${C_RESET}"
     echo -e "${C_DIM}Press [Ctrl+C] to stop.${C_RESET}\n"
-    
-    # Get initial values
-    local rx1=$(cat /sys/class/net/$iface/statistics/rx_bytes)
-    local tx1=$(cat /sys/class/net/$iface/statistics/tx_bytes)
-    
+
+    read -r rx1 < "$rx_file"
+    read -r tx1 < "$tx_file"
+
     printf "%-15s | %-15s\n" "⬇️ Download" "⬆️ Upload"
     echo "-----------------------------------"
-    
-    while true; do
-        sleep 1
-        local rx2=$(cat /sys/class/net/$iface/statistics/rx_bytes)
-        local tx2=$(cat /sys/class/net/$iface/statistics/tx_bytes)
-        
-        # Calculate diffs
-        local rx_diff=$((rx2 - rx1))
-        local tx_diff=$((tx2 - tx1))
-        
-        # Convert to KB/s
-        local rx_kbs=$((rx_diff / 1024))
-        local tx_kbs=$((tx_diff / 1024))
-        
-        # Formatting for MB/s if > 1024 KB
-        if [ $rx_kbs -gt 1024 ]; then rx_fmt=$(awk "BEGIN {printf \"%.2f MB/s\", $rx_kbs/1024}"); else rx_fmt="${rx_kbs} KB/s"; fi
-        if [ $tx_kbs -gt 1024 ]; then tx_fmt=$(awk "BEGIN {printf \"%.2f MB/s\", $tx_kbs/1024}"); else tx_fmt="${tx_kbs} KB/s"; fi
-        
+
+    trap 'stop_monitor=1' INT TERM
+    while (( ! stop_monitor )); do
+        sleep "$interval"
+        read -r rx2 < "$rx_file" || break
+        read -r tx2 < "$tx_file" || break
+
+        rx_diff=$((rx2 - rx1))
+        tx_diff=$((tx2 - tx1))
+        (( rx_diff < 0 )) && rx_diff=0
+        (( tx_diff < 0 )) && tx_diff=0
+
+        rx_kbs=$((rx_diff / 1024 / interval))
+        tx_kbs=$((tx_diff / 1024 / interval))
+        rx_fmt=$(format_rate_from_kbps "$rx_kbs")
+        tx_fmt=$(format_rate_from_kbps "$tx_kbs")
+
         printf "\r%-15s | %-15s" "$rx_fmt" "$tx_fmt"
-        
-        # Reset for next loop
+
         rx1=$rx2
         tx1=$tx2
     done
+    trap - INT TERM
+    echo
 }
 
 traffic_monitor_menu() {
@@ -3894,7 +4033,7 @@ auto_reboot_menu() {
 
 
 press_enter() {
-    echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to return to the menu..." && read -r
+    echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to return to the menu..." && read -r || true
 }
 invalid_option() {
     echo -e "\n${C_RED}❌ Invalid option.${C_RESET}" && sleep 1
@@ -3929,7 +4068,10 @@ main_menu() {
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
         echo -e "     ${C_DANGER}[99]${C_RESET} Uninstall Script             ${C_WARN}[ 0]${C_RESET} Exit"
         echo
-        read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
+        if ! read -r -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice; then
+            echo
+            exit 0
+        fi
         case $choice in
             1) create_user; press_enter ;;
             2) delete_user; press_enter ;;
@@ -3966,4 +4108,6 @@ if [[ "$1" == "--install-setup" ]]; then
     exit 0
 fi
 
+require_interactive_terminal
+sync_runtime_components_if_needed
 main_menu
