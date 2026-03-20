@@ -77,6 +77,7 @@ fi
 
 # Mandatory Dependency Check (Added jq and curl)
 check_environment() {
+    # Mandatory Dependency Check (Added jq and curl)
     for cmd in bc jq curl wget; do
         if ! command -v $cmd &> /dev/null; then
             echo -e "${C_YELLOW}⚠️ Warning: '$cmd' not found. Installing...${C_RESET}"
@@ -282,6 +283,8 @@ while true; do
                 bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
             fi
             
+            # Format the output with HTML tags since clients like HTTP Custom render Server Messages using Html.fromHtml()
+            # Crucial: Use echo -e instead of heredoc to prevent DOS CRLF syntax errors when moving script to Linux
             echo -e "<br><font color=\"yellow\"><b>      ✨ ACCOUNT STATUS ✨      </b></font><br><br>" > "/etc/firewallfalcon/banners/${user}.txt"
             echo -e "<font color=\"white\">👤 <b>Username   :</b> $user</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
             echo -e "<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
@@ -293,14 +296,18 @@ while true; do
         # --- Bandwidth Check ---
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
         
+        # Get user UID
         user_uid=$(id -u "$user" 2>/dev/null)
         [[ -z "$user_uid" ]] && continue
         
+        # Find sshd PIDs for this user via loginuid
         pids=""
         
+        # Method 1: pgrep
         m1=$(pgrep -u "$user" sshd 2>/dev/null | tr '\n' ' ')
         pids="$m1"
         
+        # Method 2: loginuid scan
         for p in /proc/[0-9]*/loginuid; do
             [[ ! -f "$p" ]] && continue
             luid=$(cat "$p" 2>/dev/null)
@@ -319,8 +326,10 @@ while true; do
             pids="$pids $pid_num"
         done
         
+        # Deduplicate
         pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
         
+        # Read accumulated usage
         usagefile="$BW_DIR/${user}.usage"
         accumulated=0
         if [[ -f "$usagefile" ]]; then
@@ -364,6 +373,7 @@ while true; do
             echo "$cur" > "$pidfile"
         done
         
+        # Clean up dead PID files
         for f in "$PID_DIR/${user}__"*.last; do
             [[ ! -f "$f" ]] && continue
             fpid=$(basename "$f" .last)
@@ -371,9 +381,11 @@ while true; do
             [[ ! -d "/proc/$fpid" ]] && rm -f "$f"
         done
         
+        # Update total
         new_total=$((accumulated + delta_total))
         echo "$new_total" > "$usagefile"
         
+        # Check quota
         quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
         
         if [[ "$new_total" -ge "$quota_bytes" ]]; then
@@ -389,6 +401,7 @@ while true; do
 done
 EOF
     chmod +x "$LIMITER_SCRIPT"
+    # Strip DOS line endings in case menu.sh was uploaded from Windows
     sed -i 's/\r$//' "$LIMITER_SCRIPT" 2>/dev/null
 
     cat > "$LIMITER_SERVICE" << EOF
@@ -422,6 +435,8 @@ EOF
 
 setup_bandwidth_service() {
     mkdir -p "$BANDWIDTH_DIR"
+    # Bandwidth monitoring is now integrated into the limiter service above.
+    # Stop the old standalone bandwidth service if it exists.
     if systemctl is-active --quiet firewallfalcon-bandwidth 2>/dev/null; then
         systemctl stop firewallfalcon-bandwidth &>/dev/null
         systemctl disable firewallfalcon-bandwidth &>/dev/null
@@ -432,19 +447,25 @@ setup_bandwidth_service() {
 setup_trial_cleanup_script() {
     cat > "$TRIAL_CLEANUP_SCRIPT" << 'TREOF'
 #!/bin/bash
+# FirewallFalcon Trial Account Auto-Cleanup
+# Usage: firewallfalcon-trial-cleanup.sh <username>
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 
 username="$1"
 if [[ -z "$username" ]]; then exit 1; fi
 
+# Kill active sessions
 killall -u "$username" -9 &>/dev/null
 sleep 1
 
+# Delete system user
 userdel -r "$username" &>/dev/null
 
+# Remove from DB
 sed -i "/^${username}:/d" "$DB_FILE"
 
+# Remove bandwidth tracking
 rm -f "$BW_DIR/${username}.usage"
 rm -rf "$BW_DIR/pidtrack/${username}"
 TREOF
@@ -1452,62 +1473,39 @@ uninstall_badvpn() {
 
 install_ssl_tunnel() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing Multiplexed HAProxy (Ports 80 & 443) ---${C_RESET}"
+    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing SSL Tunnel (HAProxy) for SSH ---${C_RESET}"
     if ! command -v haproxy &> /dev/null; then
         echo -e "\n${C_YELLOW}⚠️ HAProxy not found. Installing...${C_RESET}"
         apt-get update && apt-get install -y haproxy || { echo -e "${C_RED}❌ Failed to install HAProxy.${C_RESET}"; return; }
     fi
+    read -p "👉 Enter the port for the SSL tunnel [444]: " ssl_port
+    ssl_port=${ssl_port:-444}
+    if ! [[ "$ssl_port" =~ ^[0-9]+$ ]] || [ "$ssl_port" -lt 1 ] || [ "$ssl_port" -gt 65535 ]; then
+        echo -e "\n${C_RED}❌ Invalid port number. Aborting.${C_RESET}"
+        return
+    fi
     
-    echo -e "\n${C_BLUE}🔍 Ensuring required ports (80, 443, 10443) are free and open...${C_RESET}"
-    check_and_free_ports "80" "443" "10443" || return
-    check_and_open_firewall_port "80" tcp || return
-    check_and_open_firewall_port "443" tcp || return
+    check_and_free_ports "$ssl_port" || return
+    check_and_open_firewall_port "$ssl_port" || return
 
-    echo -e "\n${C_CYAN}Select SSL Certificate Type for HAProxy Decryption Engine:${C_RESET}"
-    echo -e "  ${C_GREEN}[ 1]${C_RESET} Self-Signed Certificate (Default)"
-    echo -e "  ${C_GREEN}[ 2]${C_RESET} Let's Encrypt Certificate (Certbot/Port 80 req.)"
-    read -p "👉 Enter choice [1]: " cert_choice
-    cert_choice=${cert_choice:-1}
-
-    mkdir -p "$SSL_CERT_DIR"
-
-    if [[ "$cert_choice" == "2" ]]; then
-        _install_certbot || return
-        read -p "👉 Enter your domain name (e.g., vps.example.com): " domain_name
-        read -p "👉 Enter your email address: " email
-        
-        systemctl stop haproxy >/dev/null 2>&1
-        systemctl stop nginx >/dev/null 2>&1
-        
-        certbot certonly --standalone -d "$domain_name" --non-interactive --agree-tos -m "$email"
-        if [ $? -eq 0 ]; then
-            echo -e "${C_GREEN}✅ Certificate obtained successfully! Creating HAProxy PEM...${C_RESET}"
-            cat "/etc/letsencrypt/live/$domain_name/fullchain.pem" "/etc/letsencrypt/live/$domain_name/privkey.pem" > "$SSL_CERT_FILE"
+    if [ -f "$SSL_CERT_FILE" ]; then
+        read -p "SSL certificate already exists. Overwrite? (y/n): " overwrite_cert
+        if [[ "$overwrite_cert" != "y" ]]; then
+            echo -e "${C_YELLOW}ℹ️ Using existing certificate.${C_RESET}"
         else
-            echo -e "${C_RED}❌ Certbot failed. Falling back to self-signed certificate.${C_RESET}"
-            cert_choice=1
+            rm -f "$SSL_CERT_FILE"
         fi
     fi
-
-    if [[ "$cert_choice" == "1" ]]; then
-        if [ -f "$SSL_CERT_FILE" ]; then
-            read -p "👉 A certificate already exists. Overwrite? (y/n): " overwrite_cert
-            if [[ "$overwrite_cert" == "y" || "$overwrite_cert" == "Y" ]]; then
-                rm -f "$SSL_CERT_FILE"
-            fi
-        fi
-        
-        if [ ! -f "$SSL_CERT_FILE" ]; then
-            echo -e "\n${C_GREEN}🔐 Generating internal loopback SSL certificate...${C_RESET}"
-            openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-                -keyout "$SSL_CERT_FILE" -out "$SSL_CERT_FILE" \
-                -subj "/CN=@FIREWALLFALCON" \
-                >/dev/null 2>&1 || { echo -e "${C_RED}❌ Failed to generate SSL certificate.${C_RESET}"; return; }
-        fi
+    if [ ! -f "$SSL_CERT_FILE" ]; then
+        echo -e "\n${C_GREEN}🔐 Generating self-signed SSL certificate...${C_RESET}"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout "$SSL_CERT_FILE" -out "$SSL_CERT_FILE" \
+            -subj "/CN=@FIREWALLFALCON" \
+            >/dev/null 2>&1 || { echo -e "${C_RED}❌ Failed to generate SSL certificate.${C_RESET}"; return; }
+        echo -e "${C_GREEN}✅ Certificate created: ${C_YELLOW}$SSL_CERT_FILE${C_RESET}"
     fi
-
-    echo -e "\n${C_GREEN}📝 Applying Multiplexed HAProxy configuration...${C_RESET}"
-    cat > "$HAPROXY_CONFIG" << 'EOF'
+    echo -e "\n${C_GREEN}📝 Creating HAProxy configuration for port $ssl_port...${C_RESET}"
+    cat > "$HAPROXY_CONFIG" <<-EOF
 global
     log /dev/log    local0
     log /dev/log    local1 notice
@@ -1517,119 +1515,38 @@ global
     user haproxy
     group haproxy
     daemon
-
 defaults
     log     global
     mode    tcp
     option  tcplog
     option  dontlognull
-    timeout connect 5s
-    timeout client  24h
-    timeout server  24h
-
-# ====================================================================
-# TIER 1: PORT 80 (Cleartext Payloads & Raw SSH)
-# ====================================================================
-frontend port_80_edge
-    bind *:80
+    timeout connect 5000
+    timeout client  50000
+    timeout server  50000
+frontend ssh_ssl_in
+    bind *:$ssl_port ssl crt $SSL_CERT_FILE
     mode tcp
-    tcp-request inspect-delay 2s
-    
-    # Check for SSH Hex
-    acl is_ssh payload(0,7) -m bin 5353482d322e30
-    
-    tcp-request content accept if is_ssh
-    tcp-request content accept if HTTP
-    
-    # 1. Raw SSH -> Port 22
-    use_backend direct_ssh if is_ssh
-    
-    # 2. Cleartext HTTP Payload -> Nginx 8880 -> Your 8080 Proxy
-    default_backend nginx_cleartext
-
-# ====================================================================
-# TIER 1: PORT 443 (TLS v2ray, SSL Payloads, Raw SSH)
-# ====================================================================
-frontend port_443_edge
-    bind *:443
-    mode tcp
-    tcp-request inspect-delay 2s
-    
-    acl is_ssh payload(0,7) -m bin 5353482d322e30
-    acl is_tls req.ssl_hello_type 1
-    
-    # Check ALPN before decryption to save v2ray!
-    acl has_web_alpn req.ssl_alpn -m sub h2 http/1.1
-    
-    tcp-request content accept if is_ssh
-    tcp-request content accept if HTTP
-    tcp-request content accept if is_tls
-    
-    # 1. Raw SSH directly on 443 -> Port 22
-    use_backend direct_ssh if is_ssh
-    
-    # 2. Cleartext Payload dropped on 443 -> Nginx 8880
-    use_backend nginx_cleartext if HTTP
-    
-    # 3. TLS with Web ALPN (v2ray / Web Payload) -> Pass RAW TLS to Nginx 8443!
-    use_backend nginx_tls if is_tls has_web_alpn
-    
-    # 4. TLS without ALPN (Any-SNI Stunnel/SSH-TLS) -> Decrypt internally
-    default_backend loopback_ssl_terminator
-
-# ====================================================================
-# TIER 2: INTERNAL DECRYPTOR (Only for Any-SNI SSH-TLS)
-# ====================================================================
-frontend internal_decryptor
-    bind 127.0.0.1:10443 ssl crt /etc/firewallfalcon/ssl/firewallfalcon.pem
-    mode tcp
-    tcp-request inspect-delay 2s
-    
-    acl is_ssh payload(0,7) -m bin 5353482d322e30
-    tcp-request content accept if is_ssh
-    tcp-request content accept if HTTP
-    
-    # 1. Inside the tunnel is pure SSH -> Port 22
-    use_backend direct_ssh if is_ssh
-    
-    # 2. Inside the tunnel is a Payload -> Nginx 8880
-    default_backend nginx_cleartext
-
-# ====================================================================
-# DESTINATION BACKENDS (Clean handoffs, no proxy headers)
-# ====================================================================
-backend direct_ssh
+    default_backend ssh_backend
+backend ssh_backend
     mode tcp
     server ssh_server 127.0.0.1:22
-
-backend nginx_cleartext
-    mode tcp
-    server nginx_8880 127.0.0.1:8880
-
-backend nginx_tls
-    mode tcp
-    server nginx_8443 127.0.0.1:8443
-
-backend loopback_ssl_terminator
-    mode tcp
-    server haproxy_ssl 127.0.0.1:10443
 EOF
-
     echo -e "\n${C_GREEN}▶️ Reloading and starting HAProxy service...${C_RESET}"
     systemctl daemon-reload
     systemctl restart haproxy
     sleep 2
     if systemctl is-active --quiet haproxy; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: Multiplexed HAProxy Tunnel is active.${C_RESET}"
-        echo -e "Clients can now connect to this server's IP directly on port ${C_YELLOW}80 or 443${C_RESET}."
+        echo -e "\n${C_GREEN}✅ SUCCESS: SSL Tunnel is active.${C_RESET}"
+        echo -e "Clients can now connect to this server's IP on port ${C_YELLOW}${ssl_port}${C_RESET} using an SSL/TLS tunnel."
     else
         echo -e "\n${C_RED}❌ ERROR: HAProxy service failed to start.${C_RESET}"
+        echo -e "${C_YELLOW}ℹ️ Displaying HAProxy status for diagnostics:${C_RESET}"
         systemctl status haproxy --no-pager
     fi
 }
 
 uninstall_ssl_tunnel() {
-    echo -e "\n${C_BOLD}${C_PURPLE}--- 🗑️ Uninstalling HAProxy ---${C_RESET}"
+    echo -e "\n${C_BOLD}${C_PURPLE}--- 🗑️ Uninstalling SSL Tunnel ---${C_RESET}"
     if ! command -v haproxy &> /dev/null; then
         echo -e "${C_YELLOW}ℹ️ HAProxy not installed, skipping.${C_RESET}"
         return
@@ -1656,7 +1573,7 @@ EOF
             rm -f "$SSL_CERT_FILE"
         fi
     fi
-    echo -e "${C_GREEN}✅ HAProxy Tunnel has been uninstalled.${C_RESET}"
+    echo -e "${C_GREEN}✅ SSL Tunnel has been uninstalled.${C_RESET}"
 }
 
 show_dnstt_details() {
