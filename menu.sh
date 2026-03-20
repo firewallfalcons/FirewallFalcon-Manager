@@ -77,6 +77,14 @@ DESEC_DOMAIN="manager.firewallfalcon.qzz.io"
 
 SELECTED_USER=""
 UNINSTALL_MODE="interactive"
+BANNER_CACHE_TTL=5
+BANNER_CACHE_TS=0
+BANNER_CACHE_OS_NAME=""
+BANNER_CACHE_UP_TIME=""
+BANNER_CACHE_RAM_USAGE=""
+BANNER_CACHE_CPU_LOAD=""
+BANNER_CACHE_ONLINE_USERS=0
+BANNER_CACHE_TOTAL_USERS=0
 
 if [[ $EUID -ne 0 ]]; then
    echo -e "${C_RED}❌ Error: This script requires root privileges to run.${C_RESET}"
@@ -97,14 +105,16 @@ check_environment() {
     done
 }
 
+ensure_firewallfalcon_dirs() {
+    mkdir -p "$DB_DIR" "$SSL_CERT_DIR" "$BANDWIDTH_DIR" "/etc/firewallfalcon/banners" /etc/ssh/sshd_config.d
+    touch "$DB_FILE"
+}
+
 initial_setup() {
     echo -e "${C_BLUE}⚙️ Initializing FirewallFalcon Manager setup...${C_RESET}"
     check_environment
     
-    mkdir -p "$DB_DIR"
-    touch "$DB_FILE"
-    mkdir -p "$SSL_CERT_DIR"
-    mkdir -p "$BANDWIDTH_DIR"
+    ensure_firewallfalcon_dirs
     
     echo -e "${C_BLUE}🔹 Configuring user limiter service...${C_RESET}"
     setup_limiter_service
@@ -488,15 +498,18 @@ TREOF
 }
 
 update_ssh_banners_config() {
+    local tmp_conf
     rm -f /usr/local/bin/firewallfalcon-login-info.sh 2>/dev/null
     
     if [[ ! -f "/etc/firewallfalcon/banners_enabled" ]]; then
-        rm -f "$SSHD_FF_CONFIG" 2>/dev/null
-        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+        if [[ -f "$SSHD_FF_CONFIG" ]]; then
+            rm -f "$SSHD_FF_CONFIG" 2>/dev/null
+            systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+        fi
         return
     fi
     
-    mkdir -p "/etc/firewallfalcon/banners" /etc/ssh/sshd_config.d
+    ensure_firewallfalcon_dirs
     
     tmp_conf="/tmp/ff_banners_new.conf"
     echo "# FirewallFalcon - Show login info native banners" > "$tmp_conf"
@@ -521,7 +534,12 @@ update_ssh_banners_config() {
 }
 
 setup_ssh_login_info() {
-    touch "/etc/firewallfalcon/banners_enabled"
+    ensure_firewallfalcon_dirs || return 1
+    if ! touch "/etc/firewallfalcon/banners_enabled"; then
+        echo -e "${C_RED}❌ Failed to enable SSH banners. Could not create /etc/firewallfalcon/banners_enabled.${C_RESET}"
+        return 1
+    fi
+    invalidate_banner_cache
     update_ssh_banners_config
 }
 
@@ -647,6 +665,11 @@ _select_user_interface() {
     fi
     
     mapfile -t all_users < <(cut -d: -f1 "$DB_FILE" | sort)
+    local -A all_user_lookup=()
+    local username
+    for username in "${all_users[@]}"; do
+        all_user_lookup["$username"]=1
+    done
     
     if [ ${#all_users[@]} -ge 15 ]; then
         read -p "👉 Enter a search term (or press Enter to list all): " search_term
@@ -668,16 +691,19 @@ _select_user_interface() {
         printf "  ${C_GREEN}[%2d]${C_RESET} %s\n" "$((i+1))" "${users[$i]}"
     done
     echo -e "\n  ${C_RED} [ 0]${C_RESET} ↩️ Cancel and return to main menu"
+    echo -e "${C_CYAN}💡 Tip: you can also type the exact username directly.${C_RESET}"
     echo
     local choice
     while true; do
-        read -p "👉 Enter the number of the user: " choice
+        read -p "👉 Enter the number or exact username: " choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 0 ] && [ "$choice" -le "${#users[@]}" ]; then
             if [ "$choice" -eq 0 ]; then
                 SELECTED_USER=""; return
             else
                 SELECTED_USER="${users[$((choice-1))]}"; return
             fi
+        elif [[ -n "${all_user_lookup[$choice]+x}" ]]; then
+            SELECTED_USER="$choice"; return
         else
             echo -e "${C_RED}❌ Invalid selection. Please try again.${C_RESET}"
         fi
@@ -695,6 +721,11 @@ _select_multi_user_interface() {
     fi
     
     mapfile -t all_users < <(cut -d: -f1 "$DB_FILE" | sort)
+    local -A all_user_lookup=()
+    local username
+    for username in "${all_users[@]}"; do
+        all_user_lookup["$username"]=1
+    done
     
     if [ ${#all_users[@]} -ge 15 ]; then
         read -p "👉 Enter a search term (or press Enter to list all): " search_term
@@ -717,11 +748,12 @@ _select_multi_user_interface() {
     done
     echo -e "\n  ${C_GREEN}[all]${C_RESET} Select ALL listed users"
     echo -e "  ${C_RED}  [0]${C_RESET} ↩️ Cancel and return to main menu"
-    echo -e "\n${C_CYAN}💡 You can select multiple! (e.g. '1 3 5' or '1,3' or '1-4')${C_RESET}"
+    echo -e "\n${C_CYAN}💡 You can select multiple by number, range, or exact username.${C_RESET}"
+    echo -e "${C_CYAN}   Examples: '1 3 5' or '1,3' or '1-4' or 'alice bob'${C_RESET}"
     echo
     local choice
     while true; do
-        read -p "👉 Enter user numbers: " choice
+        read -p "👉 Enter user numbers or usernames: " choice
         choice=$(echo "$choice" | tr ',' ' ') # Replace commas with spaces
         
         if [[ -z "$choice" ]]; then
@@ -740,6 +772,7 @@ _select_multi_user_interface() {
         
         local valid=true
         local selected_indices=()
+        local selected_names=()
         for token in $choice; do
             if [[ "$token" =~ ^[0-9]+-[0-9]+$ ]]; then
                 local start=${token%-*}
@@ -758,24 +791,35 @@ _select_multi_user_interface() {
             elif [[ "$token" =~ ^[0-9]+$ ]]; then
                 if [ "$token" -ge 1 ] && [ "$token" -le "${#users[@]}" ]; then
                     selected_indices+=($token)
+                elif [[ -n "${all_user_lookup[$token]+x}" ]]; then
+                    selected_names+=("$token")
                 else
                     valid=false; break
                 fi
+            elif [[ -n "${all_user_lookup[$token]+x}" ]]; then
+                selected_names+=("$token")
             else
                 valid=false; break
             fi
         done
         
-        if [[ "$valid" == true && ${#selected_indices[@]} -gt 0 ]]; then
+        if [[ "$valid" == true && ( ${#selected_indices[@]} -gt 0 || ${#selected_names[@]} -gt 0 ) ]]; then
             mapfile -t unique_indices < <(printf "%s\n" "${selected_indices[@]}" | sort -u -n)
             for idx in "${unique_indices[@]}"; do
                 SELECTED_USERS+=("${users[$((idx-1))]}")
             done
+            mapfile -t unique_names < <(printf "%s\n" "${selected_names[@]}" | sort -u)
+            for username in "${unique_names[@]}"; do
+                if ! printf "%s\n" "${SELECTED_USERS[@]}" | grep -Fxq "$username"; then
+                    SELECTED_USERS+=("$username")
+                fi
+            done
             return
         else
-            echo -e "${C_RED}❌ Invalid selection. Please check your numbers.${C_RESET}"
+            echo -e "${C_RED}❌ Invalid selection. Please check your numbers or usernames.${C_RESET}"
             SELECTED_USERS=()
             selected_indices=()
+            selected_names=()
         fi
     done
 }
@@ -852,6 +896,7 @@ create_user() {
         generate_client_config "$username" "$password"
     fi
     
+    invalidate_banner_cache
     update_ssh_banners_config
 }
 
@@ -864,20 +909,30 @@ delete_user() {
     if [[ "$confirm" != "y" ]]; then echo -e "\n${C_YELLOW}❌ Deletion cancelled.${C_RESET}"; return; fi
     
     echo -e "\n${C_BLUE}🗑️ Deleting selected users...${C_RESET}"
+    local username
     for username in "${SELECTED_USERS[@]}"; do
         killall -u "$username" -9 &>/dev/null
-        sleep 0.2
-        userdel -r "$username" &>/dev/null
-        if [ $? -eq 0 ]; then
-             echo -e " ✅ System user '${C_YELLOW}$username${C_RESET}' deleted."
+        if id "$username" &>/dev/null; then
+            if userdel -r "$username" &>/dev/null; then
+                echo -e " ✅ System user '${C_YELLOW}$username${C_RESET}' deleted."
+            else
+                echo -e " ❌ Failed to delete system user '${C_YELLOW}$username${C_RESET}'."
+            fi
         else
-             echo -e " ❌ Failed to delete system user '${C_YELLOW}$username${C_RESET}'."
+            echo -e " ℹ️ System user '${C_YELLOW}$username${C_RESET}' was already missing. Removing manager data only."
         fi
         rm -f "$BANDWIDTH_DIR/${username}.usage"
         rm -rf "$BANDWIDTH_DIR/pidtrack/${username}"
-        sed -i "/^$username:/d" "$DB_FILE"
     done
+
+    if [[ -f "$DB_FILE" ]]; then
+        local db_tmp
+        db_tmp=$(mktemp)
+        awk -F: 'NR==FNR { drop[$1]=1; next } !($1 in drop)' <(printf "%s\n" "${SELECTED_USERS[@]}") "$DB_FILE" > "$db_tmp" && mv "$db_tmp" "$DB_FILE"
+        rm -f "$db_tmp" 2>/dev/null
+    fi
     
+    invalidate_banner_cache
     update_ssh_banners_config
 }
 
@@ -1017,27 +1072,56 @@ list_users() {
     echo -e "${C_CYAN}=========================================================================================${C_RESET}"
     printf "${C_BOLD}${C_WHITE}%-18s | %-12s | %-10s | %-15s | %-20s${C_RESET}\n" "USERNAME" "EXPIRES" "CONNS" "BANDWIDTH" "STATUS"
     echo -e "${C_CYAN}-----------------------------------------------------------------------------------------${C_RESET}"
-    
-    while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
-        local online_count
-        online_count=$(pgrep -u "$user" sshd | wc -l)
-        
-        local status
-        status=$(get_user_status "$user")
 
-        local plain_status
-        plain_status=$(echo -e "$status" | sed 's/\x1b\[[0-9;]*m//g')
-        
+    local current_ts
+    current_ts=$(date +%s)
+    local -A system_user_lookup=()
+    local -A locked_user_lookup=()
+    local -A session_counts=()
+
+    while IFS=: read -r system_user _rest; do
+        [[ -n "$system_user" ]] && system_user_lookup["$system_user"]=1
+    done < /etc/passwd
+
+    while read -r passwd_user _ passwd_status _rest; do
+        [[ -z "$passwd_user" ]] && continue
+        if [[ "$passwd_status" == "L" ]]; then
+            locked_user_lookup["$passwd_user"]=1
+        fi
+    done < <(passwd -Sa 2>/dev/null)
+
+    while read -r ssh_user ssh_count; do
+        [[ -n "$ssh_user" && -n "$ssh_count" ]] && session_counts["$ssh_user"]="$ssh_count"
+    done < <(ps -C sshd -o user= 2>/dev/null | awk 'NF {count[$1]++} END {for (user in count) print user, count[user]}')
+
+    while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
+        local online_count="${session_counts[$user]:-0}"
         local connection_string="$online_count / $limit"
-        
-        # Bandwidth display
+        local plain_status="Active"
+        local status="${C_GREEN}🟢 Active${C_RESET}"
+
+        if [[ -z "${system_user_lookup[$user]+x}" ]]; then
+            plain_status="Not Found"
+            status="${C_RED}Not Found${C_RESET}"
+        elif [[ -n "${locked_user_lookup[$user]+x}" ]]; then
+            plain_status="Locked"
+            status="${C_YELLOW}🔒 Locked${C_RESET}"
+        elif [[ -n "$expiry" && "$expiry" != "Never" ]]; then
+            local expiry_ts
+            expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+            if [[ "$expiry_ts" =~ ^[0-9]+$ ]] && (( expiry_ts > 0 && expiry_ts < current_ts )); then
+                plain_status="Expired"
+                status="${C_RED}🗓️ Expired${C_RESET}"
+            fi
+        fi
+
         [[ -z "$bandwidth_gb" ]] && bandwidth_gb="0"
         local bw_string="Unlimited"
         if [[ "$bandwidth_gb" != "0" ]]; then
             local used_bytes=0
             if [[ -f "$BANDWIDTH_DIR/${user}.usage" ]]; then
                 used_bytes=$(cat "$BANDWIDTH_DIR/${user}.usage" 2>/dev/null)
-                [[ -z "$used_bytes" ]] && used_bytes=0
+                [[ "$used_bytes" =~ ^[0-9]+$ ]] || used_bytes=0
             fi
             local used_gb
             used_gb=$(awk "BEGIN {printf \"%.1f\", $used_bytes / 1073741824}")
@@ -1045,11 +1129,11 @@ list_users() {
         fi
 
         local line_color="$C_WHITE"
-        case $plain_status in
-            *"Active"*) line_color="$C_GREEN" ;;
-            *"Locked"*) line_color="$C_YELLOW" ;;
-            *"Expired"*) line_color="$C_RED" ;;
-            *"Not Found"*) line_color="$C_DIM" ;;
+        case "$plain_status" in
+            "Active") line_color="$C_GREEN" ;;
+            "Locked") line_color="$C_YELLOW" ;;
+            "Expired") line_color="$C_RED" ;;
+            "Not Found") line_color="$C_DIM" ;;
         esac
 
         printf "${line_color}%-18s ${C_RESET}| ${C_YELLOW}%-12s ${C_RESET}| ${C_CYAN}%-10s ${C_RESET}| ${C_ORANGE}%-15s ${C_RESET}| %-20s\n" "$user" "$expiry" "$connection_string" "$bw_string" "$status"
@@ -1114,6 +1198,7 @@ cleanup_expired() {
             sed -i "/^$user:/d" "$DB_FILE"
         done
         echo -e "\n${C_GREEN}✅ Expired users have been cleaned up.${C_RESET}"
+        invalidate_banner_cache
         update_ssh_banners_config
     else
         echo -e "\n${C_YELLOW}❌ Cleanup cancelled.${C_RESET}"
@@ -1204,6 +1289,7 @@ restore_user_data() {
     rm -rf "$temp_dir"
     echo -e "\n${C_GREEN}✅ SUCCESS: User data restore completed.${C_RESET}"
     
+    invalidate_banner_cache
     update_ssh_banners_config
 }
 
@@ -2994,35 +3080,51 @@ uninstall_xui_panel() {
     fi
 }
 
-show_banner() {
-    local os_name=$(grep -oP 'PRETTY_NAME="\K[^"]+' /etc/os-release || echo "Linux")
-    local up_time=$(uptime -p | sed 's/up //')
-    local ram_usage=$(free -m | awk '/^Mem:/{printf "%.2f", $3*100/$2}')
-    
-    # Efficient CPU Load check (Load Average)
-    local cpu_load=$(cat /proc/loadavg | awk '{print $1}')
-    
-    local online_users=0
-    # Optimize online user count: Get total active sshd procs roughly (may overcount if multiple procs per session but faster)
-    # Or just keep it if DB is small. Let's trust pgrep is okay for menu load.
-    if [[ -s "$DB_FILE" ]]; then
-        while IFS=: read -r user pass expiry limit; do
-           # Use pgrep -c for speed
-           local count=$(pgrep -c -u "$user" sshd)
-           online_users=$((online_users + count))
-        done < "$DB_FILE"
+count_managed_online_sessions() {
+    if [[ ! -s "$DB_FILE" ]]; then
+        echo 0
+        return
     fi
-    
-    local total_users=0
-    if [[ -s "$DB_FILE" ]]; then total_users=$(grep -c . "$DB_FILE"); fi
-    
+
+    local session_count
+    session_count=$(awk -F: 'NR==FNR { users[$1]=1; next } ($1 in users) { count++ } END { print count+0 }' "$DB_FILE" <(ps -C sshd -o user= 2>/dev/null))
+    [[ "$session_count" =~ ^[0-9]+$ ]] || session_count=0
+    echo "$session_count"
+}
+
+invalidate_banner_cache() {
+    BANNER_CACHE_TS=0
+}
+
+refresh_banner_cache() {
+    local now
+    now=$(date +%s)
+    if (( BANNER_CACHE_TS > 0 && now - BANNER_CACHE_TS < BANNER_CACHE_TTL )); then
+        return
+    fi
+
+    BANNER_CACHE_OS_NAME=$(grep -oP 'PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "Linux")
+    BANNER_CACHE_UP_TIME=$(uptime -p 2>/dev/null | sed 's/up //' || echo "unknown")
+    BANNER_CACHE_RAM_USAGE=$(free -m | awk '/^Mem:/{if($2>0){printf "%.2f", $3*100/$2}else{print "0.00"}}')
+    BANNER_CACHE_CPU_LOAD=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    if [[ -s "$DB_FILE" ]]; then
+        BANNER_CACHE_TOTAL_USERS=$(grep -c . "$DB_FILE")
+    else
+        BANNER_CACHE_TOTAL_USERS=0
+    fi
+    BANNER_CACHE_ONLINE_USERS=$(count_managed_online_sessions)
+    BANNER_CACHE_TS=$now
+}
+
+show_banner() {
+    refresh_banner_cache
     clear
     echo
     echo -e "${C_TITLE}   FirewallFalcon Manager ${C_RESET}${C_DIM}| v4.0.0 Premium Edition${C_RESET}"
     echo -e "${C_BLUE}   ─────────────────────────────────────────────────────────${C_RESET}"
-    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "OS" "$os_name" "Uptime: $up_time"
-    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "Memory" "${ram_usage}% Used" "Online Sessions: ${C_WHITE}${online_users}${C_RESET}"
-    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "Users" "${total_users} Managed Accounts" "Sys Load (1m): ${C_GREEN}${cpu_load}${C_RESET}"
+    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "OS" "$BANNER_CACHE_OS_NAME" "Uptime: $BANNER_CACHE_UP_TIME"
+    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "Memory" "${BANNER_CACHE_RAM_USAGE}% Used" "Online Sessions: ${C_WHITE}${BANNER_CACHE_ONLINE_USERS}${C_RESET}"
+    printf "   ${C_GRAY}%-10s${C_RESET} %-20s ${C_GRAY}|${C_RESET} %s\n" "Users" "${BANNER_CACHE_TOTAL_USERS} Managed Accounts" "Sys Load (1m): ${C_GREEN}${BANNER_CACHE_CPU_LOAD}${C_RESET}"
     echo -e "${C_BLUE}   ─────────────────────────────────────────────────────────${C_RESET}"
 }
 
@@ -3284,6 +3386,7 @@ create_trial_account() {
         generate_client_config "$username" "$password"
     fi
     
+    invalidate_banner_cache
     update_ssh_banners_config
 }
 
@@ -3397,6 +3500,7 @@ bulk_create_users() {
     echo -e "${C_YELLOW}================================================================${C_RESET}"
     echo -e "\n${C_GREEN}✅ Created $created users. Conn Limit: ${limit} | BW: ${bw_display}${C_RESET}"
     
+    invalidate_banner_cache
     update_ssh_banners_config
 }
 
@@ -3701,14 +3805,17 @@ ssh_banner_menu() {
     read -p "👉 Enter choice: " banner_choice
     case $banner_choice in
         1)
-            touch "/etc/firewallfalcon/banners_enabled"
-            update_ssh_banners_config
-            echo -e "\n${C_GREEN}✅ SSH Login Banner has been enabled!${C_RESET}"
-            echo -e "${C_DIM}Users will see account info when they connect via SSH tunnel.${C_RESET}"
+            if setup_ssh_login_info; then
+                echo -e "\n${C_GREEN}✅ SSH Login Banner has been enabled!${C_RESET}"
+                echo -e "${C_DIM}Users will see account info when they connect via SSH tunnel.${C_RESET}"
+            else
+                echo -e "\n${C_RED}❌ Failed to enable the SSH Login Banner.${C_RESET}"
+            fi
             press_enter
             ;;
         2)
             rm -f "/etc/firewallfalcon/banners_enabled"
+            invalidate_banner_cache
             update_ssh_banners_config
             echo -e "\n${C_YELLOW}❌ SSH Login Banner has been disabled.${C_RESET}"
             press_enter
