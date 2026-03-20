@@ -77,7 +77,6 @@ fi
 
 # Mandatory Dependency Check (Added jq and curl)
 check_environment() {
-    # Mandatory Dependency Check (Added jq and curl)
     for cmd in bc jq curl wget; do
         if ! command -v $cmd &> /dev/null; then
             echo -e "${C_YELLOW}⚠️ Warning: '$cmd' not found. Installing...${C_RESET}"
@@ -283,8 +282,6 @@ while true; do
                 bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
             fi
             
-            # Format the output with HTML tags since clients like HTTP Custom render Server Messages using Html.fromHtml()
-            # Crucial: Use echo -e instead of heredoc to prevent DOS CRLF syntax errors when moving script to Linux
             echo -e "<br><font color=\"yellow\"><b>      ✨ ACCOUNT STATUS ✨      </b></font><br><br>" > "/etc/firewallfalcon/banners/${user}.txt"
             echo -e "<font color=\"white\">👤 <b>Username   :</b> $user</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
             echo -e "<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>" >> "/etc/firewallfalcon/banners/${user}.txt"
@@ -296,18 +293,14 @@ while true; do
         # --- Bandwidth Check ---
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
         
-        # Get user UID
         user_uid=$(id -u "$user" 2>/dev/null)
         [[ -z "$user_uid" ]] && continue
         
-        # Find sshd PIDs for this user via loginuid
         pids=""
         
-        # Method 1: pgrep
         m1=$(pgrep -u "$user" sshd 2>/dev/null | tr '\n' ' ')
         pids="$m1"
         
-        # Method 2: loginuid scan
         for p in /proc/[0-9]*/loginuid; do
             [[ ! -f "$p" ]] && continue
             luid=$(cat "$p" 2>/dev/null)
@@ -326,10 +319,8 @@ while true; do
             pids="$pids $pid_num"
         done
         
-        # Deduplicate
         pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
         
-        # Read accumulated usage
         usagefile="$BW_DIR/${user}.usage"
         accumulated=0
         if [[ -f "$usagefile" ]]; then
@@ -373,7 +364,6 @@ while true; do
             echo "$cur" > "$pidfile"
         done
         
-        # Clean up dead PID files
         for f in "$PID_DIR/${user}__"*.last; do
             [[ ! -f "$f" ]] && continue
             fpid=$(basename "$f" .last)
@@ -381,11 +371,9 @@ while true; do
             [[ ! -d "/proc/$fpid" ]] && rm -f "$f"
         done
         
-        # Update total
         new_total=$((accumulated + delta_total))
         echo "$new_total" > "$usagefile"
         
-        # Check quota
         quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
         
         if [[ "$new_total" -ge "$quota_bytes" ]]; then
@@ -401,7 +389,6 @@ while true; do
 done
 EOF
     chmod +x "$LIMITER_SCRIPT"
-    # Strip DOS line endings in case menu.sh was uploaded from Windows
     sed -i 's/\r$//' "$LIMITER_SCRIPT" 2>/dev/null
 
     cat > "$LIMITER_SERVICE" << EOF
@@ -435,8 +422,6 @@ EOF
 
 setup_bandwidth_service() {
     mkdir -p "$BANDWIDTH_DIR"
-    # Bandwidth monitoring is now integrated into the limiter service above.
-    # Stop the old standalone bandwidth service if it exists.
     if systemctl is-active --quiet firewallfalcon-bandwidth 2>/dev/null; then
         systemctl stop firewallfalcon-bandwidth &>/dev/null
         systemctl disable firewallfalcon-bandwidth &>/dev/null
@@ -447,25 +432,19 @@ setup_bandwidth_service() {
 setup_trial_cleanup_script() {
     cat > "$TRIAL_CLEANUP_SCRIPT" << 'TREOF'
 #!/bin/bash
-# FirewallFalcon Trial Account Auto-Cleanup
-# Usage: firewallfalcon-trial-cleanup.sh <username>
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 
 username="$1"
 if [[ -z "$username" ]]; then exit 1; fi
 
-# Kill active sessions
 killall -u "$username" -9 &>/dev/null
 sleep 1
 
-# Delete system user
 userdel -r "$username" &>/dev/null
 
-# Remove from DB
 sed -i "/^${username}:/d" "$DB_FILE"
 
-# Remove bandwidth tracking
 rm -f "$BW_DIR/${username}.usage"
 rm -rf "$BW_DIR/pidtrack/${username}"
 TREOF
@@ -1271,25 +1250,204 @@ remove_ssh_banner() {
     echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to return..." && read -r
 }
 
-_install_certbot() {
-    if command -v certbot &> /dev/null; then
-        echo -e "${C_GREEN}✅ Certbot is already installed.${C_RESET}"
-        return 0
+ssh_banner_menu() {
+    while true; do
+        show_banner
+        local banner_status
+        if grep -q -E "^\s*Banner\s+$SSH_BANNER_FILE" /etc/ssh/sshd_config && [ -f "$SSH_BANNER_FILE" ]; then
+            banner_status="${C_STATUS_A}(Active)${C_RESET}"
+        else
+            banner_status="${C_STATUS_I}(Inactive)${C_RESET}"
+        fi
+        
+        echo -e "\n   ${C_TITLE}═════════════════[ ${C_BOLD}🎨 SSH Banner Management ${banner_status} ${C_RESET}${C_TITLE}]═════════════════${C_RESET}"
+        printf "     ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "📋 Paste or Edit Banner"
+        printf "     ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "👁️ View Current Banner"
+        printf "     ${C_DANGER}[ 3]${C_RESET} %-40s\n" "🗑️ Disable and Remove Banner"
+        echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
+        echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
+        echo
+        read -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice
+        case $choice in
+            1) set_ssh_banner_paste ;;
+            2) view_ssh_banner ;;
+            3) remove_ssh_banner ;;
+            0) return ;;
+            *) echo -e "\n${C_RED}❌ Invalid option.${C_RESET}" && sleep 2 ;;
+        esac
+    done
+}
+
+install_udp_custom() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing udp-custom ---${C_RESET}"
+    if [ -f "$UDP_CUSTOM_SERVICE_FILE" ]; then
+        echo -e "\n${C_YELLOW}ℹ️ udp-custom is already installed.${C_RESET}"
+        return
     fi
-    echo -e "${C_YELLOW}⚠️ Certbot (for SSL) is not found.${C_RESET}"
-    read -p "👉 Do you want to install Certbot now? (y/n): " confirm_install
-    if [[ "$confirm_install" != "y" ]]; then
-        echo -e "${C_RED}❌ Installation skipped. Cannot proceed.${C_RESET}"
-        return 1
+
+    echo -e "\n${C_GREEN}⚙️ Creating directory for udp-custom...${C_RESET}"
+    rm -rf "$UDP_CUSTOM_DIR"
+    mkdir -p "$UDP_CUSTOM_DIR"
+
+    echo -e "\n${C_GREEN}⚙️ Detecting system architecture...${C_RESET}"
+    local arch
+    arch=$(uname -m)
+    local binary_url=""
+    if [[ "$arch" == "x86_64" ]]; then
+        binary_url="https://github.com/firewallfalcons/FirewallFalcon-Manager/raw/main/udp/udp-custom-linux-amd64"
+        echo -e "${C_BLUE}ℹ️ Detected x86_64 (amd64) architecture.${C_RESET}"
+    elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
+        binary_url="https://github.com/firewallfalcons/FirewallFalcon-Manager/raw/main/udp/udp-custom-linux-arm"
+        echo -e "${C_BLUE}ℹ️ Detected ARM64 architecture.${C_RESET}"
+    else
+        echo -e "\n${C_RED}❌ Unsupported architecture: $arch. Cannot install udp-custom.${C_RESET}"
+        rm -rf "$UDP_CUSTOM_DIR"
+        return
     fi
-    echo -e "${C_BLUE}📦 Installing Certbot...${C_RESET}"
-    apt-get update > /dev/null 2>&1
-    apt-get install -y certbot || {
-        echo -e "${C_RED}❌ Failed to install Certbot.${C_RESET}"
-        return 1
-    }
-    echo -e "${C_GREEN}✅ Certbot installed successfully.${C_RESET}"
-    return 0
+
+    echo -e "\n${C_GREEN}📥 Downloading udp-custom binary...${C_RESET}"
+    wget -q --show-progress -O "$UDP_CUSTOM_DIR/udp-custom" "$binary_url"
+    if [ $? -ne 0 ]; then
+        echo -e "\n${C_RED}❌ Failed to download the udp-custom binary.${C_RESET}"
+        rm -rf "$UDP_CUSTOM_DIR"
+        return
+    fi
+    chmod +x "$UDP_CUSTOM_DIR/udp-custom"
+
+    echo -e "\n${C_GREEN}📝 Creating default config.json...${C_RESET}"
+    cat > "$UDP_CUSTOM_DIR/config.json" <<EOF
+{
+  "listen": ":36712",
+  "stream_buffer": 33554432,
+  "receive_buffer": 83886080,
+  "auth": {
+    "mode": "passwords"
+  }
+}
+EOF
+    chmod 644 "$UDP_CUSTOM_DIR/config.json"
+
+    echo -e "\n${C_GREEN}📝 Creating systemd service file...${C_RESET}"
+    cat > "$UDP_CUSTOM_SERVICE_FILE" <<EOF
+[Unit]
+Description=UDP Custom by FirewallFalcon
+After=network.target
+
+[Service]
+User=root
+Type=simple
+ExecStart=$UDP_CUSTOM_DIR/udp-custom server -exclude 53,5300
+WorkingDirectory=$UDP_CUSTOM_DIR/
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=default.target
+EOF
+
+    echo -e "\n${C_GREEN}▶️ Enabling and starting udp-custom service...${C_RESET}"
+    systemctl daemon-reload
+    systemctl enable udp-custom.service
+    systemctl start udp-custom.service
+    sleep 2
+    if systemctl is-active --quiet udp-custom; then
+        echo -e "\n${C_GREEN}✅ SUCCESS: udp-custom is installed and active.${C_RESET}"
+    else
+        echo -e "\n${C_RED}❌ ERROR: udp-custom service failed to start.${C_RESET}"
+        echo -e "${C_YELLOW}ℹ️ Displaying last 15 lines of the service log for diagnostics:${C_RESET}"
+        journalctl -u udp-custom.service -n 15 --no-pager
+    fi
+}
+
+uninstall_udp_custom() {
+    echo -e "\n${C_BOLD}${C_PURPLE}--- 🗑️ Uninstalling udp-custom ---${C_RESET}"
+    if [ ! -f "$UDP_CUSTOM_SERVICE_FILE" ]; then
+        echo -e "${C_YELLOW}ℹ️ udp-custom is not installed, skipping.${C_RESET}"
+        return
+    fi
+    echo -e "${C_GREEN}🛑 Stopping and disabling udp-custom service...${C_RESET}"
+    systemctl stop udp-custom.service >/dev/null 2>&1
+    systemctl disable udp-custom.service >/dev/null 2>&1
+    echo -e "${C_GREEN}🗑️ Removing systemd service file...${C_RESET}"
+    rm -f "$UDP_CUSTOM_SERVICE_FILE"
+    systemctl daemon-reload
+    echo -e "${C_GREEN}🗑️ Removing udp-custom directory and files...${C_RESET}"
+    rm -rf "$UDP_CUSTOM_DIR"
+    echo -e "${C_GREEN}✅ udp-custom has been uninstalled successfully.${C_RESET}"
+}
+
+
+install_badvpn() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing badvpn (udpgw) ---${C_RESET}"
+    if [ -f "$BADVPN_SERVICE_FILE" ]; then
+        echo -e "\n${C_YELLOW}ℹ️ badvpn is already installed.${C_RESET}"
+        return
+    fi
+    check_and_open_firewall_port 7300 udp || return
+    echo -e "\n${C_GREEN}🔄 Updating package lists...${C_RESET}"
+    apt-get update
+    echo -e "\n${C_GREEN}📦 Installing all required packages...${C_RESET}"
+    apt-get install -y cmake g++ make screen git build-essential libssl-dev libnspr4-dev libnss3-dev pkg-config
+    echo -e "\n${C_GREEN}📥 Cloning badvpn from github...${C_RESET}"
+    git clone https://github.com/ambrop72/badvpn.git "$BADVPN_BUILD_DIR"
+    cd "$BADVPN_BUILD_DIR" || { echo -e "${C_RED}❌ Failed to change directory to build folder.${C_RESET}"; return; }
+    echo -e "\n${C_GREEN}⚙️ Running CMake...${C_RESET}"
+    cmake . || { echo -e "${C_RED}❌ CMake configuration failed.${C_RESET}"; rm -rf "$BADVPN_BUILD_DIR"; return; }
+    echo -e "\n${C_GREEN}🛠️ Compiling source...${C_RESET}"
+    make || { echo -e "${C_RED}❌ Compilation (make) failed.${C_RESET}"; rm -rf "$BADVPN_BUILD_DIR"; return; }
+    local badvpn_binary
+    badvpn_binary=$(find "$BADVPN_BUILD_DIR" -name "badvpn-udpgw" -type f | head -n 1)
+    if [[ -z "$badvpn_binary" || ! -f "$badvpn_binary" ]]; then
+        echo -e "${C_RED}❌ ERROR: Could not find the compiled 'badvpn-udpgw' binary after compilation.${C_RESET}"
+        rm -rf "$BADVPN_BUILD_DIR"
+        return
+    fi
+    echo -e "${C_GREEN}ℹ️ Found binary at: $badvpn_binary${C_RESET}"
+    chmod +x "$badvpn_binary"
+    echo -e "\n${C_GREEN}📝 Creating systemd service file...${C_RESET}"
+    cat > "$BADVPN_SERVICE_FILE" <<-EOF
+[Unit]
+Description=BadVPN UDP Gateway
+After=network.target
+[Service]
+ExecStart=$badvpn_binary --listen-addr 0.0.0.0:7300 --max-clients 1000 --max-connections-for-client 8
+User=root
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+    echo -e "\n${C_GREEN}▶️ Enabling and starting badvpn service...${C_RESET}"
+    systemctl daemon-reload
+    systemctl enable badvpn.service
+    systemctl start badvpn.service
+    sleep 2
+    if systemctl is-active --quiet badvpn; then
+        echo -e "\n${C_GREEN}✅ SUCCESS: badvpn (udpgw) is installed and active on port 7300.${C_RESET}"
+    else
+        echo -e "\n${C_RED}❌ ERROR: badvpn service failed to start.${C_RESET}"
+        echo -e "${C_YELLOW}ℹ️ Displaying last 15 lines of the service log for diagnostics:${C_RESET}"
+        journalctl -u badvpn.service -n 15 --no-pager
+    fi
+}
+
+uninstall_badvpn() {
+    echo -e "\n${C_BOLD}${C_PURPLE}--- 🗑️ Uninstalling badvpn (udpgw) ---${C_RESET}"
+    if [ ! -f "$BADVPN_SERVICE_FILE" ]; then
+        echo -e "${C_YELLOW}ℹ️ badvpn is not installed, skipping.${C_RESET}"
+        return
+    fi
+    echo -e "${C_GREEN}🛑 Stopping and disabling badvpn service...${C_RESET}"
+    systemctl stop badvpn.service >/dev/null 2>&1
+    systemctl disable badvpn.service >/dev/null 2>&1
+    echo -e "${C_GREEN}🗑️ Removing systemd service file...${C_RESET}"
+    rm -f "$BADVPN_SERVICE_FILE"
+    systemctl daemon-reload
+    echo -e "${C_GREEN}🗑️ Removing badvpn build directory...${C_RESET}"
+    rm -rf "$BADVPN_BUILD_DIR"
+    echo -e "${C_GREEN}✅ badvpn has been uninstalled successfully.${C_RESET}"
 }
 
 install_ssl_tunnel() {
@@ -1579,6 +1737,8 @@ install_dnstt() {
 
     check_and_open_firewall_port 53 udp || return
 
+
+
     local forward_port=""
     local forward_desc=""
     echo -e "\n${C_BLUE}Please choose where DNSTT should forward traffic:${C_RESET}"
@@ -1590,6 +1750,9 @@ install_dnstt() {
         forward_port="22"
         forward_desc="SSH (port 22)"
         echo -e "${C_GREEN}ℹ️ DNSTT will forward to SSH on 127.0.0.1:22.${C_RESET}"
+        
+
+        
     elif [[ "$fwd_choice" == "2" ]]; then
         forward_port="8787"
         forward_desc="V2Ray (port 8787)"
@@ -1635,7 +1798,7 @@ install_dnstt() {
         NS_SUBDOMAIN="ns-$RANDOM_STR"
         TUNNEL_SUBDOMAIN="tun-$RANDOM_STR"
         NS_DOMAIN="$NS_SUBDOMAIN.$DESEC_DOMAIN"
-        TUNNEL_DOMAIN="$TUNNEL_DOMAIN.$DESEC_DOMAIN"
+        TUNNEL_DOMAIN="$TUNNEL_SUBDOMAIN.$DESEC_DOMAIN"
 
         local API_DATA
         API_DATA=$(printf '[{"subname": "%s", "type": "A", "ttl": 3600, "records": ["%s"]}, {"subname": "%s", "type": "NS", "ttl": 3600, "records": ["%s."]}]' \
@@ -2109,7 +2272,7 @@ purge_nginx() {
     local mode="$1"
     if [[ "$mode" != "silent" ]]; then
         clear; show_banner
-        echo -e "${C_BOLD}${C_PURPLE}--- 🔥 Purge Internal Nginx Installation ---${C_RESET}"
+        echo -e "${C_BOLD}${C_PURPLE}--- 🔥 Purge Nginx Installation ---${C_RESET}"
         if ! command -v nginx &> /dev/null; then
             echo -e "\n${C_YELLOW}ℹ️ Nginx is not installed. Nothing to do.${C_RESET}"
             return
@@ -2139,9 +2302,7 @@ purge_nginx() {
 
 install_nginx_proxy() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing Internal Nginx Proxy ---${C_RESET}"
-    echo -e "${C_DIM}This acts as the internal traffic handler for HAProxy on ports 8443 and 8880.${C_RESET}"
-    
+    echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing Nginx Main Proxy (Ports 80 & 443) ---${C_RESET}"
     if command -v nginx &> /dev/null; then
         echo -e "\n${C_YELLOW}⚠️ An existing Nginx installation was found.${C_RESET}"
         read -p "👉 To ensure a clean setup, the existing Nginx will be purged. Continue? (y/n): " confirm_purge
@@ -2153,15 +2314,17 @@ install_nginx_proxy() {
     fi
     echo -e "\n${C_BLUE}📦 Installing Nginx package...${C_RESET}"
     apt-get update && apt-get install -y nginx || { echo -e "${C_RED}❌ Failed to install Nginx.${C_RESET}"; return; }
+    
+    check_and_free_ports "80" "443" || return
 
-    # By default matching HAProxy configuration routing rules
+    # --- Custom Port Selection ---
     local tls_ports
-    read -p "👉 Enter internal TLS/SSL Port(s) [Default: 8443]: " input_tls
-    if [[ -z "$input_tls" ]]; then tls_ports="8443"; else tls_ports="$input_tls"; fi
+    read -p "👉 Enter TLS/SSL Port(s) [Default: 443]: " input_tls
+    if [[ -z "$input_tls" ]]; then tls_ports="443"; else tls_ports="$input_tls"; fi
 
     local http_ports
-    read -p "👉 Enter internal HTTP/Non-TLS Port(s) [Default: 8880]: " input_http
-    if [[ -z "$input_http" ]]; then http_ports="8880"; else http_ports="$input_http"; fi
+    read -p "👉 Enter HTTP/Non-TLS Port(s) [Default: 80]: " input_http
+    if [[ -z "$input_http" ]]; then http_ports="80"; else http_ports="$input_http"; fi
 
     # Convert to arrays
     read -a tls_ports_array <<< "$tls_ports"
@@ -2174,7 +2337,7 @@ install_nginx_proxy() {
         check_and_open_firewall_port "$port" tcp || return
     done
     
-    echo -e "\n${C_GREEN}🔐 Generating self-signed SSL certificate for internal Nginx...${C_RESET}"
+    echo -e "\n${C_GREEN}🔐 Generating self-signed SSL certificate for Nginx...${C_RESET}"
     local SSL_CERT="/etc/ssl/certs/nginx-selfsigned.pem"
     local SSL_KEY="/etc/ssl/private/nginx-selfsigned.key"
     mkdir -p /etc/ssl/certs /etc/ssl/private
@@ -2182,7 +2345,6 @@ install_nginx_proxy() {
         -keyout "$SSL_KEY" \
         -out "$SSL_CERT" \
         -subj "/CN=firewallfalcon.proxy" >/dev/null 2>&1 || { echo -e "${C_RED}❌ Failed to generate SSL certificate.${C_RESET}"; return; }
-        
     echo -e "\n${C_GREEN}📝 Applying Nginx reverse proxy configuration...${C_RESET}"
     mv "$NGINX_CONFIG_FILE" "${NGINX_CONFIG_FILE}.bak" 2>/dev/null
     
@@ -2249,9 +2411,9 @@ EOF
     systemctl restart nginx
     sleep 2
     if systemctl is-active --quiet nginx; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: Internal Nginx Reverse Proxy is active.${C_RESET}"
-        echo -e "   - Internal TLS Ports: ${C_YELLOW}${tls_ports}${C_RESET}"
-        echo -e "   - Internal HTTP Ports: ${C_YELLOW}${http_ports}${C_RESET}"
+        echo -e "\n${C_GREEN}✅ SUCCESS: Nginx Reverse Proxy is active.${C_RESET}"
+        echo -e "   - TLS Ports: ${C_YELLOW}${tls_ports}${C_RESET}"
+        echo -e "   - HTTP Ports: ${C_YELLOW}${http_ports}${C_RESET}"
         
         # Save ports for future reference
         echo "TLS_PORTS=\"$tls_ports\"" > "$NGINX_PORTS_FILE"
@@ -2265,11 +2427,32 @@ EOF
     fi
 }
 
+_install_certbot() {
+    if command -v certbot &> /dev/null; then
+        echo -e "${C_GREEN}✅ Certbot is already installed.${C_RESET}"
+        return 0
+    fi
+    echo -e "${C_YELLOW}⚠️ Certbot (for SSL) is not found.${C_RESET}"
+    read -p "👉 Do you want to install Certbot now? (y/n): " confirm_install
+    if [[ "$confirm_install" != "y" ]]; then
+        echo -e "${C_RED}❌ Installation skipped. Cannot proceed.${C_RESET}"
+        return 1
+    fi
+    echo -e "${C_BLUE}📦 Installing Certbot...${C_RESET}"
+    apt-get update > /dev/null 2>&1
+    apt-get install -y certbot || {
+        echo -e "${C_RED}❌ Failed to install Certbot.${C_RESET}"
+        return 1
+    }
+    echo -e "${C_GREEN}✅ Certbot installed successfully.${C_RESET}"
+    return 0
+}
+
 request_certbot_ssl() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🔒 Request Let's Encrypt SSL for HAProxy ---${C_RESET}"
-    if ! systemctl is-active --quiet haproxy; then
-        echo -e "\n${C_RED}❌ HAProxy is not running. Please ensure HAProxy is installed and active on Port 80.${C_RESET}"
+    echo -e "${C_BOLD}${C_PURPLE}--- 🔒 Request Let's Encrypt SSL (Certbot) ---${C_RESET}"
+    if ! systemctl is-active --quiet nginx; then
+        echo -e "\n${C_RED}❌ Nginx is not running. Please ensure Nginx is installed and active.${C_RESET}"
         return
     fi
 
@@ -2288,15 +2471,13 @@ request_certbot_ssl() {
         return
     fi
     
-    echo -e "\n${C_BLUE}🛑 Stopping Proxies temporarily for validation on Port 80...${C_RESET}"
-    systemctl stop haproxy >/dev/null 2>&1
-    systemctl stop nginx >/dev/null 2>&1
+    echo -e "\n${C_BLUE}🛑 Stopping Nginx temporarily for validation...${C_RESET}"
+    systemctl stop nginx
     sleep 2
 
     if ss -lntp | grep -q ":80\s"; then
          echo -e "${C_RED}❌ Failed to free port 80, another process might be using it. Aborting.${C_RESET}"
-         systemctl start haproxy >/dev/null 2>&1
-         systemctl start nginx >/dev/null 2>&1
+         systemctl start nginx
          return
     fi
 
@@ -2306,8 +2487,7 @@ request_certbot_ssl() {
     if [ $? -ne 0 ]; then
         echo -e "\n${C_RED}❌ Certbot failed to obtain a certificate.${C_RESET}"
         echo -e "${C_YELLOW}ℹ️ Please check your domain's DNS 'A' record points to this server's IP.${C_RESET}"
-        systemctl start haproxy >/dev/null 2>&1
-        systemctl start nginx >/dev/null 2>&1
+        systemctl start nginx
         return
     fi
 
@@ -2316,32 +2496,36 @@ request_certbot_ssl() {
 
     if [ ! -f "$SSL_CERT_LIVE" ] || [ ! -f "$SSL_KEY_LIVE" ]; then
         echo -e "\n${C_RED}❌ Certbot succeeded, but cert files not found at expected location.${C_RESET}"
-        systemctl start haproxy >/dev/null 2>&1
-        systemctl start nginx >/dev/null 2>&1
+        systemctl start nginx
         return
     fi
 
     echo -e "\n${C_GREEN}✅ Certificate obtained successfully!${C_RESET}"
-    echo -e "${C_BLUE}📝 Updating HAProxy certificate...${C_RESET}"
+    echo -e "${C_BLUE}📝 Updating Nginx configuration...${C_RESET}"
 
-    mkdir -p "$SSL_CERT_DIR"
-    cat "$SSL_CERT_LIVE" "$SSL_KEY_LIVE" > "$SSL_CERT_FILE"
+    cp "$NGINX_CONFIG_FILE" "${NGINX_CONFIG_FILE}.bak.selfsigned"
+    
+    sed -i "s|server_name _;|server_name $domain_name;|" "$NGINX_CONFIG_FILE"
+    sed -i "s|ssl_certificate /etc/ssl/certs/nginx-selfsigned.pem;|ssl_certificate $SSL_CERT_LIVE;|" "$NGINX_CONFIG_FILE"
+    sed -i "s|ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;|ssl_certificate_key $SSL_KEY_LIVE;|" "$NGINX_CONFIG_FILE"
 
-    echo -e "\n${C_BLUE}▶️ Restarting Services with new certificate...${C_RESET}"
-    systemctl start haproxy >/dev/null 2>&1
-    systemctl start nginx >/dev/null 2>&1
+    echo -e "\n${C_BLUE}▶️ Restarting Nginx with new certificate...${C_RESET}"
+    systemctl start nginx
     sleep 2
     
-    if systemctl is-active --quiet haproxy; then
-        echo -e "\n${C_GREEN}✅ SUCCESS: HAProxy is active with your new Let's Encrypt certificate!${C_RESET}"
+    if systemctl is-active --quiet nginx; then
+        echo -e "\n${C_GREEN}✅ SUCCESS: Nginx is active with your new Let's Encrypt certificate!${C_RESET}"
     else
-        echo -e "\n${C_RED}❌ ERROR: HAProxy failed to start with the new certificate.${C_RESET}"
+        echo -e "\n${C_RED}❌ ERROR: Nginx failed to start with the new certificate.${C_RESET}"
+        echo -e "${C_YELLOW}🔄 Restoring self-signed certificate config...${C_RESET}"
+        mv "${NGINX_CONFIG_FILE}.bak.selfsigned" "$NGINX_CONFIG_FILE"
+        systemctl restart nginx
     fi
 }
 
 nginx_proxy_menu() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🌐 Internal Web Proxy Management ---${C_RESET}"
+    echo -e "${C_BOLD}${C_PURPLE}--- 🌐 Nginx Main Proxy Management ---${C_RESET}"
     
     local active_status="${C_STATUS_I}Inactive${C_RESET}"
     if systemctl is-active --quiet nginx; then
@@ -2352,23 +2536,23 @@ nginx_proxy_menu() {
     local ports_info=""
     if [ -f "$NGINX_PORTS_FILE" ]; then
         source "$NGINX_PORTS_FILE"
-        ports_info="\n    ${C_DIM}Internal TLS: $TLS_PORTS | Internal HTTP: $HTTP_PORTS${C_RESET}"
+        ports_info="\n    ${C_DIM}TLS: $TLS_PORTS | HTTP: $HTTP_PORTS${C_RESET}"
     fi
 
-    echo -e "\n${C_WHITE}Current Nginx Status: ${active_status}${ports_info}"
+    echo -e "\n${C_WHITE}Current Status: ${active_status}${ports_info}"
     
     echo -e "\n${C_BOLD}Select an action:${C_RESET}\n"
     
     if systemctl is-active --quiet nginx; then
-         printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "🛑 Stop Internal Nginx Service"
-         printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "🔄 Restart Internal Nginx Service"
+         printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "🛑 Stop Nginx Service"
+         printf "  ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "🔄 Restart Nginx Service"
          printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Re-install/Re-configure (Change Ports)"
-         printf "  ${C_CHOICE}[ 4]${C_RESET} %-40s\n" "🔒 Request/Renew HAProxy SSL (Certbot)"
-         printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Internal Nginx"
+         printf "  ${C_CHOICE}[ 4]${C_RESET} %-40s\n" "🔒 Request/Renew SSL (Certbot)"
+         printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Nginx"
     else
-         printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "▶️ Start Internal Nginx Service"
-         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Install/Configure Internal Nginx"
-         printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Internal Nginx"
+         printf "  ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "▶️ Start Nginx Service"
+         printf "  ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "⚙️ Install/Configure Nginx"
+         printf "  ${C_CHOICE}[ 5]${C_RESET} %-40s\n" "🔥 Uninstall/Purge Nginx"
     fi
 
     echo -e "\n  ${C_WARN}[ 0]${C_RESET} ↩️ Return to previous menu"
@@ -2411,6 +2595,7 @@ install_xui_panel() {
     clear; show_banner
     echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Install X-UI Panel ---${C_RESET}"
     echo -e "\nThis will download and run the official installation script for X-UI."
+    echo -e "Choose an installation option:\n"
     echo -e "Choose an installation option:\n"
     printf "  ${C_GREEN}[ 1]${C_RESET} %-40s\n" "Install the latest version of X-UI"
     printf "  ${C_GREEN}[ 2]${C_RESET} %-40s\n" "Install a specific version of X-UI"
@@ -2507,8 +2692,14 @@ protocol_menu() {
         local udp_custom_status; if systemctl is-active --quiet udp-custom; then udp_custom_status="${C_STATUS_A}(Active)${C_RESET}"; else udp_custom_status="${C_STATUS_I}(Inactive)${C_RESET}"; fi
         local zivpn_status; if systemctl is-active --quiet zivpn.service; then zivpn_status="${C_STATUS_A}(Active)${C_RESET}"; else zivpn_status="${C_STATUS_I}(Inactive)${C_RESET}"; fi
         
+        local ssl_tunnel_text="SSL Tunnel (Port 444)"
         local ssl_tunnel_status="${C_STATUS_I}(Inactive)${C_RESET}"
         if systemctl is-active --quiet haproxy; then
+            local active_port
+            active_port=$(grep -oP 'bind \*:(\d+)' "$HAPROXY_CONFIG" 2>/dev/null | awk -F: '{print $2}')
+            if [[ -n "$active_port" ]]; then
+                ssl_tunnel_text="SSL Tunnel (Port $active_port)"
+            fi
             ssl_tunnel_status="${C_STATUS_A}(Active)${C_RESET}"
         fi
         
@@ -2531,13 +2722,13 @@ protocol_menu() {
         printf "     ${C_CHOICE}[ 2]${C_RESET} %-45s\n" "🗑️ Uninstall badvpn"
         printf "     ${C_CHOICE}[ 3]${C_RESET} %-45s %s\n" "🚀 Install udp-custom" "$udp_custom_status"
         printf "     ${C_CHOICE}[ 4]${C_RESET} %-45s\n" "🗑️ Uninstall udp-custom"
-        printf "     ${C_CHOICE}[ 5]${C_RESET} %-45s %s\n" "🔒 Install Multiplexed HAProxy (80/443)" "$ssl_tunnel_status"
-        printf "     ${C_CHOICE}[ 6]${C_RESET} %-45s\n" "🗑️ Uninstall HAProxy"
+        printf "     ${C_CHOICE}[ 5]${C_RESET} %-45s %s\n" "🔒 Install ${ssl_tunnel_text}" "$ssl_tunnel_status"
+        printf "     ${C_CHOICE}[ 6]${C_RESET} %-45s\n" "🗑️ Uninstall SSL Tunnel"
         printf "     ${C_CHOICE}[ 7]${C_RESET} %-45s %s\n" "📡 Install/View DNSTT (Port 53)" "$dnstt_status"
         printf "     ${C_CHOICE}[ 8]${C_RESET} %-45s\n" "🗑️ Uninstall DNSTT"
         printf "     ${C_CHOICE}[ 9]${C_RESET} %-45s %s\n" "🦅 Install Falcon Proxy (Select Version)" "$falconproxy_status"
         printf "     ${C_CHOICE}[10]${C_RESET} %-45s\n" "🗑️ Uninstall Falcon Proxy"
-        printf "     ${C_CHOICE}[11]${C_RESET} %-45s %s\n" "🌐 Install/Manage Internal Nginx" "$nginx_status"
+        printf "     ${C_CHOICE}[11]${C_RESET} %-45s %s\n" "🌐 Install/Manage Nginx Proxy (80/443)" "$nginx_status"
         printf "     ${C_CHOICE}[16]${C_RESET} %-45s %s\n" "🛡️ Install ZiVPN (UDP 5667)" "$zivpn_status"
         printf "     ${C_CHOICE}[17]${C_RESET} %-45s\n" "🗑️ Uninstall ZiVPN"
         
@@ -2884,7 +3075,7 @@ generate_client_config() {
         local managed_domain=$(grep 'FULL_DOMAIN' "$DNS_INFO_FILE" | cut -d'"' -f2)
         if [[ -n "$managed_domain" ]]; then host_domain="$managed_domain"; fi
     fi
-    # Also check if HAProxy Certbot is used
+    # Also check if Nginx Certbot is used
     if [ -f "$NGINX_CONFIG_FILE" ]; then
         local nginx_domain=$(grep -oP 'server_name \K[^\s;]+' "$NGINX_CONFIG_FILE" | head -n 1)
         if [[ "$nginx_domain" != "_" && -n "$nginx_domain" ]]; then host_domain="$nginx_domain"; fi
@@ -2906,11 +3097,30 @@ generate_client_config() {
     echo -e "   • Port: 22"
     echo -e "   • payload: (Standard SSH)"
 
-    # 2. SSL/TLS Tunnel (HAProxy Multiplexed)
+    # 2. SSL/TLS Tunnel (HAProxy or Nginx)
+    local ssl_port=""
+    local ssl_type=""
+    
+    # Check HAProxy
     if systemctl is-active --quiet haproxy; then
-        echo -e "\n🔹 ${C_BOLD}SSL/TLS Tunnel (Multiplexed HAProxy)${C_RESET}:"
+        local haproxy_port=$(grep -oP 'bind \*:(\d+)' "$HAPROXY_CONFIG" 2>/dev/null | awk -F: '{print $2}')
+        if [[ -n "$haproxy_port" ]]; then ssl_port="$haproxy_port"; ssl_type="HAProxy"; fi
+    fi
+    # Check Nginx (Override if both exist, or show both)
+    if systemctl is-active --quiet nginx && [ -f "$NGINX_PORTS_FILE" ]; then
+         source "$NGINX_PORTS_FILE"
+         # Take the first TLS port
+         local nginx_ssl_port=$(echo "$TLS_PORTS" | awk '{print $1}')
+         if [[ -n "$nginx_ssl_port" ]]; then 
+            if [[ -n "$ssl_port" ]]; then ssl_port="$ssl_port, $nginx_ssl_port"; else ssl_port="$nginx_ssl_port"; fi
+            ssl_type="Nginx/TLS"
+         fi
+    fi
+    
+    if [[ -n "$ssl_port" ]]; then
+        echo -e "\n🔹 ${C_BOLD}SSL/TLS Tunnel ($ssl_type)${C_RESET}:"
         echo -e "   • Host: $host_domain"
-        echo -e "   • Port(s): 80 (HTTP/SSH), 443 (TLS/SSH)"
+        echo -e "   • Port(s): $ssl_port"
         echo -e "   • SNI (BugHost): $host_domain (or your preferred SNI)"
     fi
 
