@@ -112,7 +112,7 @@ check_environment() {
 }
 
 ensure_firewallfalcon_dirs() {
-    mkdir -p "$DB_DIR" "$SSL_CERT_DIR" "$BANDWIDTH_DIR" "/etc/firewallfalcon/banners" /etc/ssh/sshd_config.d
+    mkdir -p "$DB_DIR" "$SSL_CERT_DIR" "$BANDWIDTH_DIR" /etc/ssh/sshd_config.d
     touch "$DB_FILE"
 }
 
@@ -138,8 +138,9 @@ initial_setup() {
     echo -e "${C_BLUE}🔹 Installing trial account cleanup script...${C_RESET}"
     setup_trial_cleanup_script
     
-    echo -e "${C_BLUE}🔹 Configuring SSH login info banner...${C_RESET}"
-    setup_ssh_login_info
+    echo -e "${C_BLUE}🔹 Cleaning legacy dynamic SSH banner hooks...${C_RESET}"
+    disable_dynamic_ssh_banner_system
+    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
     
     if [ ! -f "$INSTALL_FLAG_FILE" ]; then
         touch "$INSTALL_FLAG_FILE"
@@ -250,29 +251,14 @@ setup_limiter_service() {
     # Combined limiter + bandwidth monitoring
     cat > "$LIMITER_SCRIPT" << 'EOF'
 #!/bin/bash
-# FirewallFalcon limiter version 2026-03-20.1
+# FirewallFalcon limiter version 2026-03-22.1
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 PID_DIR="$BW_DIR/pidtrack"
-BANNER_DIR="/etc/firewallfalcon/banners"
 SCAN_INTERVAL=30
 
 mkdir -p "$BW_DIR" "$PID_DIR"
 shopt -s nullglob
-
-write_banner_if_changed() {
-    local user="$1"
-    local content="$2"
-    local banner_file="$BANNER_DIR/${user}.txt"
-    local tmp_file="${banner_file}.tmp"
-
-    printf "%s" "$content" > "$tmp_file"
-    if ! cmp -s "$tmp_file" "$banner_file" 2>/dev/null; then
-        mv "$tmp_file" "$banner_file"
-    else
-        rm -f "$tmp_file"
-    fi
-}
 
 while true; do
     if [[ ! -s "$DB_FILE" ]]; then
@@ -281,7 +267,6 @@ while true; do
     fi
 
     current_ts=$(date +%s)
-    banners_enabled=false
     declare -A session_counts=()
     declare -A session_pids=()
     declare -A locked_users=()
@@ -319,11 +304,6 @@ while true; do
         [[ "$passwd_status" == "L" ]] && locked_users["$passwd_user"]=1
     done < <(passwd -Sa 2>/dev/null)
 
-    if [[ -f "/etc/firewallfalcon/banners_enabled" ]]; then
-        mkdir -p "$BANNER_DIR"
-        banners_enabled=true
-    fi
-
     while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
         [[ -z "$user" || "$user" == \#* ]] && continue
 
@@ -357,44 +337,6 @@ while true; do
             else
                 killall -u "$user" -9 &>/dev/null
             fi
-        fi
-
-        if $banners_enabled; then
-            days_left="N/A"
-            if [[ "$expiry" != "Never" && -n "$expiry" && "$expiry_ts" =~ ^[0-9]+$ && $expiry_ts -gt 0 ]]; then
-                diff_secs=$((expiry_ts - current_ts))
-                if (( diff_secs <= 0 )); then
-                    days_left="EXPIRED"
-                else
-                    d_l=$(( diff_secs / 86400 ))
-                    h_l=$(( (diff_secs % 86400) / 3600 ))
-                    if (( d_l == 0 )); then
-                        days_left="${h_l}h left"
-                    else
-                        days_left="${d_l}d ${h_l}h"
-                    fi
-                fi
-            fi
-
-            bw_info="Unlimited"
-            if [[ "$bandwidth_gb" != "0" && -n "$bandwidth_gb" ]]; then
-                usagefile="$BW_DIR/${user}.usage"
-                accum_disp=0
-                if [[ -f "$usagefile" ]]; then
-                    read -r accum_disp < "$usagefile"
-                    [[ "$accum_disp" =~ ^[0-9]+$ ]] || accum_disp=0
-                fi
-                used_gb=$(awk "BEGIN {printf \"%.2f\", $accum_disp / 1073741824}")
-                remain_gb=$(awk "BEGIN {r=$bandwidth_gb - $used_gb; if(r<0) r=0; printf \"%.2f\", r}")
-                bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
-            fi
-
-            banner_content="<br><font color=\"yellow\"><b>      ✨ ACCOUNT STATUS ✨      </b></font><br><br>"
-            banner_content+="<font color=\"white\">👤 <b>Username   :</b> $user</font><br>"
-            banner_content+="<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>"
-            banner_content+="<font color=\"white\">📊 <b>Bandwidth  :</b> $bw_info</font><br>"
-            banner_content+="<font color=\"white\">🔌 <b>Sessions   :</b> $online_count/$limit</font><br><br>"
-            write_banner_if_changed "$user" "$banner_content"
         fi
 
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
@@ -503,9 +445,13 @@ EOF
 }
 
 sync_runtime_components_if_needed() {
-    local limiter_marker="# FirewallFalcon limiter version 2026-03-20.1"
+    local limiter_marker="# FirewallFalcon limiter version 2026-03-22.1"
     if [[ ! -f "$LIMITER_SCRIPT" ]] || ! grep -Fqx "$limiter_marker" "$LIMITER_SCRIPT" 2>/dev/null; then
         setup_limiter_service >/dev/null 2>&1
+    fi
+    if [[ -f "$SSHD_FF_CONFIG" || -f "/etc/firewallfalcon/banners_enabled" ]]; then
+        disable_dynamic_ssh_banner_system
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
     fi
 }
 
@@ -548,50 +494,20 @@ TREOF
     chmod +x "$TRIAL_CLEANUP_SCRIPT"
 }
 
+disable_dynamic_ssh_banner_system() {
+    rm -f "/etc/firewallfalcon/banners_enabled" "$SSHD_FF_CONFIG" /usr/local/bin/firewallfalcon-login-info.sh 2>/dev/null
+    rm -rf "/etc/firewallfalcon/banners" 2>/dev/null
+    invalidate_banner_cache
+}
+
 update_ssh_banners_config() {
-    local tmp_conf
-    rm -f /usr/local/bin/firewallfalcon-login-info.sh 2>/dev/null
-    
-    if [[ ! -f "/etc/firewallfalcon/banners_enabled" ]]; then
-        if [[ -f "$SSHD_FF_CONFIG" ]]; then
-            rm -f "$SSHD_FF_CONFIG" 2>/dev/null
-            systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
-        fi
-        return
-    fi
-    
-    ensure_firewallfalcon_dirs
-    
-    tmp_conf="/tmp/ff_banners_new.conf"
-    echo "# FirewallFalcon - Show login info native banners" > "$tmp_conf"
-    
-    if [[ -f "$DB_FILE" ]]; then
-        while IFS=: read -r u _rest; do
-            [[ -z "$u" || "$u" == \#* ]] && continue
-            echo "Match User $u" >> "$tmp_conf"
-            echo "    Banner /etc/firewallfalcon/banners/${u}.txt" >> "$tmp_conf"
-        done < "$DB_FILE"
-    fi
-    
-    if ! cmp -s "$tmp_conf" "$SSHD_FF_CONFIG" 2>/dev/null; then
-        mv "$tmp_conf" "$SSHD_FF_CONFIG"
-        if ! grep -q "^Include /etc/ssh/sshd_config.d/" /etc/ssh/sshd_config 2>/dev/null; then
-            echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
-        fi
-        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
-    else
-        rm -f "$tmp_conf"
-    fi
+    disable_dynamic_ssh_banner_system
 }
 
 setup_ssh_login_info() {
-    ensure_firewallfalcon_dirs || return 1
-    if ! touch "/etc/firewallfalcon/banners_enabled"; then
-        echo -e "${C_RED}❌ Failed to enable SSH banners. Could not create /etc/firewallfalcon/banners_enabled.${C_RESET}"
-        return 1
-    fi
-    invalidate_banner_cache
-    update_ssh_banners_config
+    echo -e "${C_YELLOW}⚠️ Dynamic per-user SSH banners have been removed.${C_RESET}"
+    echo -e "${C_CYAN}Use the Static SSH Banner menu to paste a custom banner instead.${C_RESET}"
+    return 1
 }
 
 
@@ -956,7 +872,6 @@ create_user() {
     fi
     
     invalidate_banner_cache
-    update_ssh_banners_config
 }
 
 delete_user() {
@@ -992,7 +907,6 @@ delete_user() {
     fi
     
     invalidate_banner_cache
-    update_ssh_banners_config
 }
 
 edit_user() {
@@ -1259,7 +1173,6 @@ cleanup_expired() {
         done
         echo -e "\n${C_GREEN}✅ Expired users have been cleaned up.${C_RESET}"
         invalidate_banner_cache
-        update_ssh_banners_config
     else
         echo -e "\n${C_YELLOW}❌ Cleanup cancelled.${C_RESET}"
     fi
@@ -1350,11 +1263,11 @@ restore_user_data() {
     echo -e "\n${C_GREEN}✅ SUCCESS: User data restore completed.${C_RESET}"
     
     invalidate_banner_cache
-    update_ssh_banners_config
 }
 
 _enable_banner_in_sshd_config() {
     echo -e "\n${C_BLUE}⚙️ Configuring sshd_config...${C_RESET}"
+    disable_dynamic_ssh_banner_system
     sed -i.bak -E 's/^( *Banner *).*/#\1/' /etc/ssh/sshd_config
     if ! grep -q -E "^Banner $SSH_BANNER_FILE" /etc/ssh/sshd_config; then
         echo -e "\n# FirewallFalcon SSH Banner\nBanner $SSH_BANNER_FILE" >> /etc/ssh/sshd_config
@@ -1384,14 +1297,15 @@ _restart_ssh() {
 
 set_ssh_banner_paste() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 📋 Paste SSH Banner ---${C_RESET}"
-    echo -e "Paste your banner code below. Press ${C_YELLOW}[Ctrl+D]${C_RESET} when you are finished."
+    echo -e "${C_BOLD}${C_PURPLE}--- 📋 Paste Static SSH Banner ---${C_RESET}"
+    echo -e "Paste your custom banner below. Press ${C_YELLOW}[Ctrl+D]${C_RESET} when you are finished."
+    echo -e "${C_DIM}This will be shown to all SSH users through 'Banner $SSH_BANNER_FILE'.${C_RESET}"
     echo -e "${C_DIM}The current banner (if any) will be overwritten.${C_RESET}"
     echo -e "--------------------------------------------------"
     cat > "$SSH_BANNER_FILE"
     chmod 644 "$SSH_BANNER_FILE"
     echo -e "\n--------------------------------------------------"
-    echo -e "\n${C_GREEN}✅ Banner content saved from paste.${C_RESET}"
+    echo -e "\n${C_GREEN}✅ Static banner content saved.${C_RESET}"
     _enable_banner_in_sshd_config
     _restart_ssh
     echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to return..." && read -r
@@ -1425,6 +1339,7 @@ remove_ssh_banner() {
     else
         echo -e "\n${C_YELLOW}ℹ️ No banner file to remove.${C_RESET}"
     fi
+    disable_dynamic_ssh_banner_system
     echo -e "\n${C_BLUE}⚙️ Disabling banner in sshd_config...${C_RESET}"
     sed -i.bak -E "s/^( *Banner\s+$SSH_BANNER_FILE)/#\1/" /etc/ssh/sshd_config
     echo -e "${C_GREEN}✅ Banner disabled in configuration.${C_RESET}"
@@ -3507,7 +3422,6 @@ create_trial_account() {
     fi
     
     invalidate_banner_cache
-    update_ssh_banners_config
 }
 
 view_user_bandwidth() {
@@ -3621,7 +3535,6 @@ bulk_create_users() {
     echo -e "\n${C_GREEN}✅ Created $created users. Conn Limit: ${limit} | BW: ${bw_display}${C_RESET}"
     
     invalidate_banner_cache
-    update_ssh_banners_config
 }
 
 generate_client_config() {
@@ -3919,78 +3832,35 @@ _flush_torrent_rules() {
 }
 
 ssh_banner_menu() {
-    clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🎨 SSH Login Banner ---${C_RESET}"
-    
-    echo -e "\n${C_CYAN}When enabled, users connecting via SSH tunnel (HTTP Custom,"
-    echo -e "HTTP Injector, etc.) will see their account details:${C_RESET}"
-    echo -e "  • Days/hours remaining"
-    echo -e "  • Bandwidth used and remaining"
-    echo -e "  • Active sessions count"
-    
-    # Check current status
-    if [[ -f "$SSHD_FF_CONFIG" ]]; then
-        echo -e "\n  Status: ${C_GREEN}✅ ENABLED${C_RESET}"
-    else
-        echo -e "\n  Status: ${C_RED}❌ DISABLED${C_RESET}"
-    fi
-    
-    echo -e "\n${C_BOLD}Options:${C_RESET}\n"
-    printf "  ${C_CHOICE}[ 1]${C_RESET} %-35s\n" "✅ Enable Login Banner"
-    printf "  ${C_CHOICE}[ 2]${C_RESET} %-35s\n" "❌ Disable Login Banner"
-    printf "  ${C_CHOICE}[ 3]${C_RESET} %-35s\n" "📝 Preview Banner (test with a user)"
-    echo -e "\n  ${C_WARN}[ 0]${C_RESET} ↩️ Return"
-    echo
-    read -p "👉 Enter choice: " banner_choice
-    case $banner_choice in
-        1)
-            if setup_ssh_login_info; then
-                echo -e "\n${C_GREEN}✅ SSH Login Banner has been enabled!${C_RESET}"
-                echo -e "${C_DIM}Users will see account info when they connect via SSH tunnel.${C_RESET}"
-            else
-                echo -e "\n${C_RED}❌ Failed to enable the SSH Login Banner.${C_RESET}"
-            fi
-            press_enter
-            ;;
-        2)
-            rm -f "/etc/firewallfalcon/banners_enabled"
-            invalidate_banner_cache
-            update_ssh_banners_config
-            echo -e "\n${C_YELLOW}❌ SSH Login Banner has been disabled.${C_RESET}"
-            press_enter
-            ;;
-        3)
-            # Force background service to regenerate to ensure the syntax error fix is applied
-            # even if the user didn't run the --install-setup command!
-            echo -e "${C_DIM}Re-syncing background limiter service...${C_RESET}"
-            setup_limiter_service >/dev/null 2>&1
-            
-            if [[ ! -f "/etc/firewallfalcon/banners_enabled" ]]; then
-                echo -e "\n${C_RED}❌ You must ENABLE the Login Banner (Option 1) before you can preview it!${C_RESET}"
-                echo -e "${C_YELLOW}The service only generates these files while the feature is active.${C_RESET}"
-                press_enter
-                return
-            fi
-            _select_user_interface "--- 📝 Preview Login Banner ---"
-            local u=$SELECTED_USER
-            if [[ -z "$u" || "$u" == "NO_USERS" ]]; then return; fi
-            echo -e "\n${C_CYAN}--- Banner Preview for user '$u' ---${C_RESET}\n"
-            if [[ -f "/etc/firewallfalcon/banners/${u}.txt" ]]; then
-                cat "/etc/firewallfalcon/banners/${u}.txt"
-            else
-                echo -e "${C_RED}Banner file not generated yet. Waiting up to 15s for limiter to write it...${C_RESET}"
-                sleep 5
-                if ! cat "/etc/firewallfalcon/banners/${u}.txt" 2>/dev/null; then
-                    echo -e "\n${C_RED}Still not generated. The limiter service MUST be crashing! Here is the error log:${C_RESET}"
-                    echo -e "----------------------------------------------------------------------"
-                    journalctl -u firewallfalcon-limiter -n 15 --no-pager
-                    echo -e "----------------------------------------------------------------------"
-                fi
-            fi
-            press_enter
-            ;;
-        *) return ;;
-    esac
+    while true; do
+        show_banner
+        local banner_status
+        if grep -q -E "^\s*Banner\s+$SSH_BANNER_FILE" /etc/ssh/sshd_config && [ -f "$SSH_BANNER_FILE" ]; then
+            banner_status="${C_STATUS_A}(Active)${C_RESET}"
+        else
+            banner_status="${C_STATUS_I}(Inactive)${C_RESET}"
+        fi
+
+        echo -e "\n   ${C_TITLE}═════════════════[ ${C_BOLD}🎨 STATIC SSH BANNER ${banner_status} ${C_RESET}${C_TITLE}]═════════════════${C_RESET}"
+        echo -e "${C_DIM}Uses the standard OpenSSH directive: Banner $SSH_BANNER_FILE${C_RESET}"
+        printf "     ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "📋 Paste or Replace Static Banner"
+        printf "     ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "👁️ View Current Banner"
+        printf "     ${C_DANGER}[ 3]${C_RESET} %-40s\n" "🗑️ Disable and Remove Banner"
+        echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
+        echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
+        echo
+        if ! read -r -p "$(echo -e ${C_PROMPT}"👉 Select an option: "${C_RESET})" choice; then
+            echo
+            return
+        fi
+        case $choice in
+            1) set_ssh_banner_paste ;;
+            2) view_ssh_banner ;;
+            3) remove_ssh_banner ;;
+            0) return ;;
+            *) echo -e "\n${C_RED}❌ Invalid option.${C_RESET}" && sleep 1 ;;
+        esac
+    done
 }
 
 auto_reboot_menu() {
@@ -4061,7 +3931,7 @@ main_menu() {
         echo
         echo -e "   ${C_TITLE}══════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "15" "☁️  CloudFlare Free Domain" "18" "💾 Backup User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "16" "🎨 SSH Banner Config" "19" "📥 Restore User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "16" "🎨 Static SSH Banner" "19" "📥 Restore User Data"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "17" "🔄 Auto-Reboot Task" "20" "🧹 Cleanup Expired Users"
 
         echo
